@@ -2,62 +2,53 @@
 
 KarsaCode is a minimal web GUI for coding agents (currently Codex and Claude, more coming soon).
 
-## Installation
+**Developed by Tool4File**
 
-> [!WARNING]
-> KarsaCode currently supports Codex, Claude, and OpenCode.
-> Install and authenticate at least one provider before use:
->
-> - Codex: install [Codex CLI](https://developers.openai.com/codex/cli) and run `codex login`
-> - Claude: install [Claude Code](https://claude.com/product/claude-code) and run `claude auth login`
-> - OpenCode: install [OpenCode](https://opencode.ai) and run `opencode auth login`
+## Supported Providers
 
-### Run without installing
+KarsaCode currently supports these coding agents:
 
-```bash
-npx t3
-```
+- **Codex**: Install [Codex CLI](https://developers.openai.com/codex/cli) and run `codex login`
+- **Claude**: Install [Claude Code](https://claude.com/product/claude-code) and run `claude auth login`
+- **OpenCode**: Install [OpenCode](https://opencode.ai) and run `opencode auth login`
 
-### Desktop app
+## Development
 
-Install the latest version of the desktop app from [GitHub Releases](https://github.com/Quoriath/karsacode/releases), or from your favorite package registry:
-
-#### Windows (`winget`)
+### Setup
 
 ```bash
-winget install T3Tools.KarsaCode
-```
-
-#### macOS (Homebrew)
-
-```bash
-brew install --cask karsa-code
-```
-
-#### Arch Linux (AUR)
-
-```bash
-yay -S karsacode-bin
-```
-
-## Some notes
-
-We are very very early in this project. Expect bugs.
-
-We are not accepting contributions yet.
-
-Observability guide: [docs/observability.md](./docs/observability.md)
-
-## If you REALLY want to contribute still.... read this first
-
-Before local development, prepare the environment and install dependencies:
-
-```bash
-# Optional: only needed if you use mise for dev tool management.
-mise install
+# Install dependencies
 bun install .
+
+# Optional: only needed if you use mise for dev tool management
+mise install
 ```
 
-Read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening an issue or PR.
+### Running the Application
 
-Need support? Join the [Discord](https://discord.gg/jn4EGJjrvv).
+```bash
+# Development mode
+bun dev
+
+# Build
+bun build
+
+# Type checking
+bun typecheck
+
+# Linting
+bun lint
+
+# Formatting
+bun fmt
+```
+
+## Documentation
+
+- Observability guide: [docs/observability.md](./docs/observability.md)
+- Keybindings: [KEYBINDINGS.md](./KEYBINDINGS.md)
+- Remote access: [REMOTE.md](./REMOTE.md)
+
+## Support
+
+For internal support and questions, contact the development team.
