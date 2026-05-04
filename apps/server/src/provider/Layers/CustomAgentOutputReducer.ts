@@ -231,20 +231,49 @@ function compactGitStatus(text: string): string {
 
 function compactGitDiff(text: string): string {
   const lines = text.split(/\r?\n/);
-  const hunks = lines.filter((l) => l.startsWith("@@") || l.startsWith("+")).slice(0, 100);
+  const fileHeaders = lines.filter((line) => /^diff --git |^\+\+\+ |^--- /.test(line)).slice(0, 30);
+  const stats = lines.filter((line) => /\|\s+\d+\s+[+-]+|files? changed/.test(line)).slice(0, 50);
+  const hunks = lines
+    .filter((line) => line.startsWith("@@") || /^[+-](?![+-]{2})/.test(line))
+    .slice(0, 120);
   if (hunks.length < lines.length) {
     return [
       `Diff: ${lines.length} lines, ${hunks.filter((l) => l.startsWith("+")).length} added, ${hunks.filter((l) => l.startsWith("-")).length} removed`,
+      ...stats,
+      ...fileHeaders,
       ...hunks,
     ].join("\n");
   }
   return text;
 }
 
+function compactGitSummary(text: string): string {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const statusLines = lines.filter((line) => /^[ MADRCU?!]{1,2}\s+\S/.test(line)).slice(0, 60);
+  const stats = lines
+    .filter((line) => /\|\s+\d+\s+[+-]+|files? changed|^== .+ ==$/.test(line))
+    .slice(0, 80);
+  return [
+    statusLines.length > 0 ? `Status entries: ${statusLines.length}` : "",
+    ...statusLines,
+    stats.length > 0 ? "Diff stats:" : "",
+    ...stats,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function compactGitLog(text: string): string {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  return lines
+    .filter((line) => /^(commit\s+[a-f0-9]+|[a-f0-9]{7,}\s|Author:|Date:|\s{4}\S)/i.test(line))
+    .slice(0, 80)
+    .join("\n");
+}
+
 // ── Search Output Compaction ──────────────────────────────────
 
-function compactSearchResults(text: string, toolName: string): string {
-  if (toolName !== "search_repo") return text;
+function compactSearchResults(text: string): string {
   const lines = text.split(/\r?\n/);
   const fileMap = new Map<string, string[]>();
   for (const line of lines) {
@@ -264,6 +293,39 @@ function compactSearchResults(text: string, toolName: string): string {
   ].join("\n");
 }
 
+function compactDirectoryListing(text: string): string {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !/^total\s+\d+/i.test(line));
+  const directories = lines.filter((line) => line.endsWith("/") || /^d/.test(line));
+  const files = lines.filter((line) => !directories.includes(line));
+  return [
+    `Listing: ${directories.length} dirs, ${files.length} files`,
+    ...directories.slice(0, 30),
+    ...files.slice(0, 70),
+    lines.length > 100 ? `...${lines.length - 100} more entries omitted` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function commandKindFromPurpose(toolName: string, purpose: string): string {
+  const haystack = `${toolName} ${purpose}`.toLowerCase();
+  if (/\bgit\s+status\b/.test(haystack) && /\bgit\s+diff\b/.test(haystack)) return "git_summary";
+  if (/\bgit\s+status\b/.test(haystack)) return "git_status";
+  if (/\bgit\s+(diff|show)\b/.test(haystack)) return "git_diff";
+  if (/\bgit\s+log\b/.test(haystack)) return "git_log";
+  if (/\b(rg|grep)\b/.test(haystack)) return "search";
+  if (/\b(ls|find|tree)\b/.test(haystack)) return "listing";
+  if (/\b(test|vitest|jest|pytest|cargo test|go test|bun test|npm test|pnpm test)\b/.test(haystack))
+    return "test";
+  if (/\b(tsc|typecheck|eslint|oxlint|lint|biome|clippy|ruff|rubocop)\b/.test(haystack))
+    return "diagnostic";
+  if (/\b(logs?|tail)\b/.test(haystack)) return "log";
+  return toolName.startsWith("run_command") ? "command" : toolName;
+}
+
 // ── Main Reduction Entrypoint ──────────────────────────────────
 
 export function reduceCustomAgentOutput(input: {
@@ -279,20 +341,24 @@ export function reduceCustomAgentOutput(input: {
 
   let processed = redacted;
 
-  // Apply RTK-style compaction based on tool type
-  switch (input.toolName) {
+  const commandKind = commandKindFromPurpose(input.toolName, input.purpose);
+
+  // Apply RTK-style compaction based on tool type / command kind
+  switch (commandKind) {
     case "read_file": {
       processed = removeComments(processed, input.fileExtension);
       processed = collapseWhitespace(processed);
       processed = smartTruncate(processed, 80, true);
       break;
     }
-    case "search_repo": {
-      processed = compactSearchResults(processed, input.toolName);
+    case "search_repo":
+    case "search": {
+      processed = compactSearchResults(processed);
       processed = smartTruncate(processed, 40, true);
       break;
     }
-    case "run_command": {
+    case "test":
+    case "diagnostic": {
       processed = compactTestOutput(processed);
       processed = smartTruncate(processed, 60, true);
       break;
@@ -306,6 +372,16 @@ export function reduceCustomAgentOutput(input: {
       processed = smartTruncate(processed, 80, true);
       break;
     }
+    case "git_summary": {
+      processed = compactGitSummary(processed);
+      processed = smartTruncate(processed, 80, true);
+      break;
+    }
+    case "git_log": {
+      processed = compactGitLog(processed);
+      processed = smartTruncate(processed, 80, false);
+      break;
+    }
     case "list_files": {
       const lines = processed.split(/\r?\n/);
       const grouped = groupByPattern(lines, /^(.+\/)/, (m) => m[1]!);
@@ -313,6 +389,18 @@ export function reduceCustomAgentOutput(input: {
         processed = grouped.map((g) => `  ${g.group} (${g.count} items)`).join("\n");
       }
       processed = smartTruncate(processed, 50, false);
+      break;
+    }
+    case "listing": {
+      processed = compactDirectoryListing(processed);
+      processed = smartTruncate(processed, 80, false);
+      break;
+    }
+    case "log": {
+      let lines = processed.split(/\r?\n/);
+      lines = removeBoilerplate(lines);
+      lines = deduplicateLines(lines);
+      processed = smartTruncate(lines.join("\n"), 80, true);
       break;
     }
     default: {

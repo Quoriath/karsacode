@@ -83,6 +83,8 @@ function isIncomingResponse(value: unknown): value is typeof JsonRpcResponseEnve
   return Schema.is(JsonRpcResponseEnvelope)(value);
 }
 
+const JsonValueFromString = Schema.fromJsonString(Schema.Unknown);
+
 const encodeWireMessage = (
   message: Record<string, unknown>,
 ): Effect.Effect<string, CodexError.CodexAppServerProtocolParseError> =>
@@ -286,7 +288,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       }).pipe(
         Effect.flatMap(() =>
           Effect.try({
-            try: () => JSON.parse(line),
+            try: () => Schema.decodeUnknownSync(JsonValueFromString)(line),
             catch: (cause) =>
               new CodexError.CodexAppServerProtocolParseError({
                 detail: "Failed to decode Codex App Server wire message",

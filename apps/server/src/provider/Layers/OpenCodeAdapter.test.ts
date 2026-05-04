@@ -193,9 +193,7 @@ const openCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)({
 
 const OpenCodeAdapterTestLayer = Layer.effect(
   OpenCodeAdapter,
-  Effect.gen(function* () {
-    return yield* makeOpenCodeAdapter(openCodeAdapterTestSettings);
-  }),
+  makeOpenCodeAdapter(openCodeAdapterTestSettings),
 ).pipe(
   Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
@@ -393,10 +391,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     const customInstanceId = ProviderInstanceId.make("opencode_zen");
     const adapterLayer = Layer.effect(
       OpenCodeAdapter,
-      Effect.gen(function* () {
-        return yield* makeOpenCodeAdapter(openCodeAdapterTestSettings, {
-          instanceId: customInstanceId,
-        });
+      makeOpenCodeAdapter(openCodeAdapterTestSettings, {
+        instanceId: customInstanceId,
       }),
     ).pipe(
       Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
@@ -444,10 +440,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     const customInstanceId = ProviderInstanceId.make("opencode_zen");
     const adapterLayer = Layer.effect(
       OpenCodeAdapter,
-      Effect.gen(function* () {
-        return yield* makeOpenCodeAdapter(openCodeAdapterTestSettings, {
-          instanceId: customInstanceId,
-        });
+      makeOpenCodeAdapter(openCodeAdapterTestSettings, {
+        instanceId: customInstanceId,
       }),
     ).pipe(
       Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
@@ -490,10 +484,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     const customInstanceId = ProviderInstanceId.make("opencode_zen");
     const adapterLayer = Layer.effect(
       OpenCodeAdapter,
-      Effect.gen(function* () {
-        return yield* makeOpenCodeAdapter(openCodeAdapterTestSettings, {
-          instanceId: customInstanceId,
-        });
+      makeOpenCodeAdapter(openCodeAdapterTestSettings, {
+        instanceId: customInstanceId,
       }),
     ).pipe(
       Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
@@ -634,10 +626,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
       const adapterLayer = Layer.effect(
         OpenCodeAdapter,
-        Effect.gen(function* () {
-          return yield* makeOpenCodeAdapter(openCodeAdapterTestSettings, {
-            nativeEventLogger,
-          });
+        makeOpenCodeAdapter(openCodeAdapterTestSettings, {
+          nativeEventLogger,
         }),
       ).pipe(
         Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),

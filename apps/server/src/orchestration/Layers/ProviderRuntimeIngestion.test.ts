@@ -2065,6 +2065,80 @@ describe("ProviderRuntimeIngestion", () => {
     expect(finalMessage?.streaming).toBe(false);
   });
 
+  it("streams custom agent assistant deltas even when global assistant streaming is disabled", async () => {
+    const harness = await createHarness({ serverSettings: { enableAssistantStreaming: false } });
+    const now = new Date().toISOString();
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-custom-agent-turn-started-live"),
+      provider: ProviderDriverKind.make("customAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-custom-agent-live"),
+    });
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-custom-agent-live",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-custom-agent-delta-live"),
+      provider: ProviderDriverKind.make("customAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-custom-agent-live"),
+      itemId: asItemId("item-custom-agent-live"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "live custom",
+      },
+    });
+
+    const liveThread = await waitForThread(harness.engine, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-custom-agent-live" &&
+          message.streaming &&
+          message.text === "live custom",
+      ),
+    );
+    const liveMessage = liveThread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-custom-agent-live",
+    );
+    expect(liveMessage?.streaming).toBe(true);
+
+    harness.emit({
+      type: "item.completed",
+      eventId: asEventId("evt-custom-agent-completed-live"),
+      provider: ProviderDriverKind.make("customAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-custom-agent-live"),
+      itemId: asItemId("item-custom-agent-live"),
+      payload: {
+        itemType: "assistant_message",
+        status: "completed",
+        detail: "live custom",
+      },
+    });
+
+    const finalThread = await waitForThread(harness.engine, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-custom-agent-live" && !message.streaming,
+      ),
+    );
+    const finalMessage = finalThread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-custom-agent-live",
+    );
+    expect(finalMessage?.text).toBe("live custom");
+    expect(finalMessage?.streaming).toBe(false);
+  });
+
   it("spills oversized buffered deltas and still finalizes full assistant text", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();

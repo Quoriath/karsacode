@@ -1,7 +1,7 @@
 import type { CustomAgentSettings } from "@t3tools/contracts";
 import type { CustomAgentContextStore } from "./CustomAgentContextStore.ts";
 import { reduceCustomAgentOutput } from "./CustomAgentOutputReducer.ts";
-import { searchCustomAgentRepo } from "./CustomAgentSearch.ts";
+import { getCustomAgentProjectContext, searchCustomAgentRepo } from "./CustomAgentSearch.ts";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -40,6 +40,7 @@ export interface SkillResult {
 }
 
 export type CustomAgentSkillName =
+  | "skill_project_orientation"
   | "skill_code_review"
   | "skill_refactor"
   | "skill_test_generation"
@@ -54,6 +55,54 @@ function readText(file: string): Promise<string> {
 }
 
 // ── Built-in Skills ───────────────────────────────────────────
+
+const projectOrientationSkill: CustomAgentSkill = {
+  id: "skill_project_orientation",
+  name: "Project Orientation",
+  description:
+    "Builds a compact workspace orientation from indexed file counts, extensions, top-level shape, stack signals, package managers, and OS/runtime context.",
+  whenToUse:
+    "Use at the start of broad repo analysis, onboarding, or when the user asks what project is active without needing exact file contents.",
+  parameters: [
+    {
+      name: "maxFiles",
+      description: "Maximum files to count before reporting truncation",
+      required: false,
+      type: "number",
+    },
+  ],
+  examples: [
+    '{"type":"tool_call","tool":"skill_execute","args":{"skillId":"skill_project_orientation","args":{"maxFiles":20000},"purpose":"Orient on active repo"}}',
+  ],
+  estimatedTokensSaved: "80% - replaces broad file listing with compact project metadata",
+  execute: async (args, ctx) => {
+    const maxFiles =
+      typeof args.maxFiles === "number" && Number.isFinite(args.maxFiles)
+        ? args.maxFiles
+        : undefined;
+    const context = await getCustomAgentProjectContext({
+      settings: ctx.settings,
+      workspaceRoot: ctx.workspaceRoot,
+      ...(maxFiles !== undefined ? { maxFiles } : {}),
+    });
+    return {
+      ok: true,
+      content: [
+        context.summary,
+        "",
+        `Workspace: ${context.workspaceRoot}`,
+        `Top-level dirs: ${context.topLevelDirs.map((entry) => `${entry.name}:${entry.count}`).join(", ")}`,
+        `Package managers: ${context.packageManagers.join(", ") || "unknown"}`,
+        "No file names were expanded beyond top-level directory names and aggregate counts.",
+      ].join("\n"),
+      summary: context.summary,
+      suggestedNextSteps: [
+        "Use find_files for filename discovery",
+        "Use search_repo or semantic_search before reading files",
+      ],
+    };
+  },
+};
 
 const codeReviewSkill: CustomAgentSkill = {
   id: "skill_code_review",
@@ -795,6 +844,7 @@ export interface CustomAgentSkillRegistry {
 }
 
 const BUILT_IN_SKILLS: ReadonlyArray<CustomAgentSkill> = [
+  projectOrientationSkill,
   codeReviewSkill,
   refactorSkill,
   testGenerationSkill,

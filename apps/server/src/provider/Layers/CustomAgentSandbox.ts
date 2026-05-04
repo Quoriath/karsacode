@@ -181,13 +181,13 @@ export async function runCustomAgentCommand(input: {
     const stdoutReduced = reduceCustomAgentOutput({
       raw: result.stdout,
       toolName: "run_command.stdout",
-      purpose: "command stdout",
+      purpose: `command stdout: ${input.command}`,
       settings: input.settings,
     });
     const stderrReduced = reduceCustomAgentOutput({
       raw: result.stderr,
       toolName: "run_command.stderr",
-      purpose: "command stderr",
+      purpose: `command stderr: ${input.command}`,
       settings: input.settings,
     });
     const stdoutArtifact = input.contextStore.storeArtifact({
@@ -243,13 +243,13 @@ export async function runCustomAgentCommand(input: {
     const stdoutReduced = reduceCustomAgentOutput({
       raw: stdout,
       toolName: "run_command.stdout",
-      purpose: "command stdout",
+      purpose: `command stdout: ${input.command}`,
       settings: input.settings,
     });
     const stderrReduced = reduceCustomAgentOutput({
       raw: stderr,
       toolName: "run_command.stderr",
-      purpose: "command stderr",
+      purpose: `command stderr: ${input.command}`,
       settings: input.settings,
     });
     const stdoutArtifact = input.contextStore.storeArtifact({

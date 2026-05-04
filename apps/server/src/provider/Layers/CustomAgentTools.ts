@@ -24,7 +24,12 @@ import {
   newCustomAgentId,
   type CustomAgentRiskLevel,
 } from "./CustomAgentSandbox.ts";
-import { listCustomAgentFiles, searchCustomAgentRepo } from "./CustomAgentSearch.ts";
+import {
+  findCustomAgentFiles,
+  getCustomAgentProjectContext,
+  listCustomAgentFiles,
+  searchCustomAgentRepo,
+} from "./CustomAgentSearch.ts";
 import { semanticSearchCustomAgent } from "./CustomAgentSemanticSearch.ts";
 import { makeCustomAgentMcp } from "./CustomAgentMcp.ts";
 import { makeCustomAgentSkillRegistry, formatSkillListForPrompt } from "./CustomAgentSkills.ts";
@@ -37,9 +42,12 @@ export type CustomAgentToolName =
   | "edit_file"
   | "apply_patch"
   | "run_command"
+  | "tool_batch"
   | "search_repo"
+  | "find_files"
   | "semantic_search"
   | "list_files"
+  | "project_context"
   | "git_status"
   | "git_diff"
   | "working_tree_summary"
@@ -234,9 +242,12 @@ export function makeCustomAgentToolRegistry(input: {
     "edit_file",
     "apply_patch",
     "run_command",
+    "tool_batch",
     "search_repo",
+    "find_files",
     "semantic_search",
     "list_files",
+    "project_context",
     "git_status",
     "git_diff",
     "working_tree_summary",
@@ -358,6 +369,53 @@ export function makeCustomAgentToolRegistry(input: {
           files: listed.files.slice(0, 100),
           artifactId: artifact.id,
         }),
+        artifactId: artifact.id,
+      };
+    }
+    if (name === "project_context") {
+      const maxFiles = numberArg(args, "maxFiles");
+      const result = await getCustomAgentProjectContext({
+        settings: input.settings,
+        workspaceRoot: input.workspaceRoot,
+        ...(maxFiles !== undefined ? { maxFiles } : {}),
+      });
+      return {
+        ok: true,
+        content: JSON.stringify(result),
+        data: {
+          projectName: result.projectName,
+          totalFiles: result.totalFiles,
+          extensions: result.extensions,
+          projectSignals: result.projectSignals,
+        },
+      };
+    }
+    if (name === "find_files") {
+      const findInput: Parameters<typeof findCustomAgentFiles>[0] = {
+        settings: input.settings,
+        workspaceRoot: input.workspaceRoot,
+      };
+      if (typeof args.query === "string") findInput.query = args.query;
+      if (typeof args.extension === "string") findInput.extension = args.extension;
+      if (typeof args.path === "string") findInput.path = args.path;
+      const maxResults = numberArg(args, "maxResults");
+      if (maxResults !== undefined) findInput.maxResults = maxResults;
+      const result = await findCustomAgentFiles(findInput);
+      const artifact = input.contextStore.storeArtifact({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        toolCallId: context.toolCallId,
+        kind: "file.find",
+        content: result.files.join("\n"),
+        summary: result.summary,
+        preview: result.files.slice(0, 80).join("\n"),
+        sensitive: false,
+        truncated: result.totalMatches > result.files.length,
+        metadata: { query: args.query, extension: args.extension },
+      });
+      return {
+        ok: true,
+        content: JSON.stringify({ ...result, artifactId: artifact.id }),
         artifactId: artifact.id,
       };
     }
@@ -586,13 +644,60 @@ export function makeCustomAgentToolRegistry(input: {
       });
       return { ok: true, content: JSON.stringify(result), data: result };
     }
+    if (name === "tool_batch") {
+      const calls = Array.isArray(args.calls)
+        ? args.calls.filter((call): call is Record<string, unknown> => {
+            return typeof call === "object" && call !== null && !Array.isArray(call);
+          })
+        : [];
+      const allowedBatchTools = new Set<CustomAgentToolName>([
+        "project_context",
+        "find_files",
+        "list_files",
+        "search_repo",
+        "semantic_search",
+        "read_file",
+        "git_status",
+        "git_diff",
+        "working_tree_summary",
+        "summarize_artifact",
+      ]);
+      if (calls.length === 0) return { ok: false, content: "tool_batch needs non-empty calls." };
+      const results: Array<{ tool: string; ok: boolean; content: string; artifactId?: string }> = [];
+      for (const [index, call] of calls.slice(0, 6).entries()) {
+        const tool = typeof call.tool === "string" ? call.tool : "";
+        const callArgs =
+          typeof call.args === "object" && call.args !== null && !Array.isArray(call.args)
+            ? (call.args as Record<string, unknown>)
+            : {};
+        if (!allowedBatchTools.has(tool as CustomAgentToolName)) {
+          results.push({ tool, ok: false, content: "Tool is not allowed in read-only batch." });
+          continue;
+        }
+        const childResult = await execute(
+          tool,
+          { ...callArgs, purpose: String(callArgs.purpose ?? `batch step ${index + 1}`) },
+          { ...context, toolCallId: `${context.toolCallId}_${index + 1}` },
+        );
+        results.push({
+          tool,
+          ok: childResult.ok,
+          content: childResult.content.slice(0, input.settings.maxToolPreviewBytes),
+          ...(childResult.artifactId ? { artifactId: childResult.artifactId } : {}),
+        });
+      }
+      return {
+        ok: results.every((result) => result.ok),
+        content: JSON.stringify({ results, truncatedToCalls: Math.min(calls.length, 6) }),
+      };
+    }
     if (name === "git_status" || name === "git_diff" || name === "working_tree_summary") {
       const command =
         name === "git_status"
           ? "git status --porcelain=v1 -b"
           : name === "git_diff"
-            ? "git diff --stat && git diff --compact-summary"
-            : "git status --short && git diff --stat";
+            ? "printf '== unstaged diff stat ==\\n'; git diff --stat; printf '\\n== unstaged compact summary ==\\n'; git diff --compact-summary; printf '\\n== staged diff stat ==\\n'; git diff --cached --stat; printf '\\n== staged compact summary ==\\n'; git diff --cached --compact-summary"
+            : "printf '== status ==\\n'; git status --short; printf '\\n== unstaged diff stat ==\\n'; git diff --stat; printf '\\n== staged diff stat ==\\n'; git diff --cached --stat";
       const result = await runCustomAgentCommand({
         settings: { ...input.settings, blockedCommands: [] },
         contextStore: input.contextStore,

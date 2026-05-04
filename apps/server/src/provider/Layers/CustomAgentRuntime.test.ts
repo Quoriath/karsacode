@@ -22,6 +22,7 @@ import {
   resolveCustomAgentChatCompletionsUrl,
 } from "./CustomAgentLlmBackend.ts";
 import { makeCustomAgentRuntime } from "./CustomAgentRuntime.ts";
+import { buildCustomAgentRuntimePrompt } from "./CustomAgentPrompt.ts";
 import { makeCustomAgentContextStore } from "./CustomAgentContextStore.ts";
 import { makeCustomAgentToolRegistry } from "./CustomAgentTools.ts";
 import { reduceCustomAgentOutput, redactCustomAgentSecrets } from "./CustomAgentOutputReducer.ts";
@@ -74,6 +75,24 @@ async function runtimeWithBackend(
   });
 }
 
+async function takeRuntimeEvent(
+  queue: Queue.Queue<import("@t3tools/contracts").ProviderRuntimeEvent>,
+  predicate: (event: import("@t3tools/contracts").ProviderRuntimeEvent) => boolean,
+  timeoutMs = 500,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remaining = Math.max(1, deadline - Date.now());
+    const event = await Promise.race([
+      Effect.runPromise(Queue.take(queue)),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), remaining)),
+    ]);
+    if (!event) break;
+    if (predicate(event)) return event;
+  }
+  throw new Error("Timed out waiting for Custom Agent runtime event");
+}
+
 describe("CustomAgent provider", () => {
   it("decodes settings defaults and registers the driver", () => {
     const decoded = Schema.decodeSync(CustomAgentSettings)({});
@@ -87,6 +106,20 @@ describe("CustomAgent provider", () => {
     expect(
       BUILT_IN_DRIVERS.some((driver) => driver.driverKind === CustomAgentDriver.driverKind),
     ).toBe(true);
+  });
+
+  it("instructs repo-analysis requests to inspect with safe tools instead of asking permission", () => {
+    const prompt = buildCustomAgentRuntimePrompt({
+      systemPrompt: "You are Karsa.",
+      toolNames: ["list_files", "read_file", "search_repo"],
+      mcpEnabled: false,
+      checkpointEnabled: true,
+      semanticSearchEnabled: false,
+    });
+
+    expect(prompt).toContain("For repository/project analysis requests");
+    expect(prompt).toContain("do not answer by asking permission to inspect");
+    expect(prompt).toContain("call list_files");
   });
 
   it("parses final and tool-call JSON strictly", () => {
@@ -148,6 +181,10 @@ describe("CustomAgent provider", () => {
       );
       await expect(backend.complete({ messages: [], model: "gpt-5.5" })).resolves.toMatchObject({
         content: '{"type":"final","content":"ok"}',
+      });
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+        response_format: { type: "json_object" },
+        stream: false,
       });
       expect(fetchMock).toHaveBeenCalledTimes(3);
       expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
@@ -218,9 +255,61 @@ describe("CustomAgent provider", () => {
         content += chunk;
       expect(content).toBe('{"type":"final","content":"ok"}');
       const firstCall = fetchMock.mock.calls[0] as unknown as [string, { body?: string }];
-      expect(JSON.parse(String(firstCall?.[1]?.body))).toMatchObject({
+      const body = JSON.parse(String(firstCall?.[1]?.body));
+      expect(body).toMatchObject({
         stream: true,
       });
+      expect(body).not.toHaveProperty("response_format");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("streams OpenAI-compatible data chunks without a trailing newline", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          'data: {"choices":[{"delta":{"content":"{\\"content\\":\\"ok\\",\\"type\\":\\"final\\"}"}}]}',
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const backend = makeOpenAiCompatibleCustomAgentBackend(
+        settings({
+          apiBaseUrl: "http://127.0.0.1:8317/v1",
+          apiKey: "dummy",
+        }),
+        {},
+      );
+      let content = "";
+      for await (const chunk of backend.stream({ messages: [], model: "gpt-5.5" }))
+        content += chunk;
+      expect(content).toBe('{"content":"ok","type":"final"}');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("streams raw OpenAI-compatible JSON chunks without SSE framing", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          '{"choices":[{"delta":{"content":"{\\"content\\":\\"raw ok\\",\\"type\\":\\"final\\"}"}}]}',
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const backend = makeOpenAiCompatibleCustomAgentBackend(
+        settings({
+          apiBaseUrl: "http://127.0.0.1:8317/v1",
+          apiKey: "dummy",
+        }),
+        {},
+      );
+      let content = "";
+      for await (const chunk of backend.stream({ messages: [], model: "gpt-5.5" }))
+        content += chunk;
+      expect(content).toBe('{"content":"raw ok","type":"final"}');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -251,6 +340,82 @@ describe("CustomAgent provider", () => {
     ).toBe(true);
   });
 
+  it("emits final answer content while the model JSON response is still streaming", async () => {
+    let releaseStream: (() => void) | undefined;
+    const streamCanFinish = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const backend: CustomAgentLlmBackend = {
+      ...makeFakeCustomAgentBackend([]),
+      stream: async function* () {
+        yield '{"type":"final","content":"Hel';
+        await streamCanFinish;
+        yield 'lo"}';
+      },
+      complete: async () => ({
+        content: '{"type":"final","content":"fallback"}',
+      }),
+    };
+    const rt = await runtimeWithBackend(backend);
+    const threadId = ThreadId.make("thread-live-final-stream");
+    await rt.startSession({ threadId, runtimeMode: "approval-required" });
+    await rt.sendTurn({ threadId, input: "hi" });
+
+    const firstDelta = await takeRuntimeEvent(
+      rt.events,
+      (event) => event.type === "content.delta" && event.payload.delta === "Hel",
+    );
+
+    expect(firstDelta.type).toBe("content.delta");
+    releaseStream?.();
+    const completed = await takeRuntimeEvent(
+      rt.events,
+      (event) =>
+        event.type === "turn.completed" &&
+        "state" in event.payload &&
+        event.payload.state === "completed",
+    );
+    expect(completed.type).toBe("turn.completed");
+  });
+
+  it("emits final answer content before the final JSON type field arrives", async () => {
+    let releaseStream: (() => void) | undefined;
+    const streamCanFinish = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const backend: CustomAgentLlmBackend = {
+      ...makeFakeCustomAgentBackend([]),
+      stream: async function* () {
+        yield '{"content":"Hel';
+        await streamCanFinish;
+        yield 'lo","type":"final"}';
+      },
+      complete: async () => ({
+        content: '{"type":"final","content":"fallback"}',
+      }),
+    };
+    const rt = await runtimeWithBackend(backend);
+    const threadId = ThreadId.make("thread-live-content-before-type");
+    await rt.startSession({ threadId, runtimeMode: "approval-required" });
+    await rt.sendTurn({ threadId, input: "hi" });
+
+    const firstDelta = await takeRuntimeEvent(
+      rt.events,
+      (event) => event.type === "content.delta" && event.payload.delta === "Hel",
+    );
+
+    expect(firstDelta.type).toBe("content.delta");
+    releaseStream?.();
+    const completed = await takeRuntimeEvent(
+      rt.events,
+      (event) =>
+        event.type === "turn.completed" &&
+        "state" in event.payload &&
+        event.payload.state === "completed",
+    );
+    expect(completed.type).toBe("turn.completed");
+  });
+
   it("sends explicit Custom Agent protocol and tool guidance in the system prompt", async () => {
     let prompt = "";
     const backend: CustomAgentLlmBackend = {
@@ -269,6 +434,8 @@ describe("CustomAgent provider", () => {
     expect(prompt).toContain("Do not emit native OpenAI tool_calls");
     expect(prompt).toContain("read_file:");
     expect(prompt).toContain("mcp_list_servers");
+    expect(prompt).toContain("Token saver playbook");
+    expect(prompt).toContain("Emit final answers as soon as you have enough evidence");
   });
 
   it("starts/stops sessions and streams a simple final answer", async () => {
@@ -460,6 +627,45 @@ describe("CustomAgent provider", () => {
     expect(seenRoles.length).toBeGreaterThan(1);
     expect(seenRoles[1]).not.toContain("tool");
     expect(seenRoles[1]?.at(-2)).toBe("user");
+  });
+
+  it("summarizes tool activities and skips repeated identical tool calls", async () => {
+    const workspace = tmpWorkspace();
+    await writeFile(path.join(workspace, "a.txt"), "hello\n");
+    const rt = await runtime(
+      [
+        '{"type":"tool_call","tool":"read_file","args":{"path":"a.txt","purpose":"read"}}',
+        '{"type":"tool_call","tool":"read_file","args":{"path":"a.txt","purpose":"read"}}',
+        '{"type":"final","content":"done"}',
+      ],
+      workspace,
+    );
+    const threadId = ThreadId.make("thread-repeat-tool");
+    await rt.startSession({ threadId, runtimeMode: "approval-required" });
+    await rt.sendTurn({ threadId, input: "read" });
+
+    const completedRead = await takeRuntimeEvent(
+      rt.events,
+      (event) =>
+        event.type === "item.completed" &&
+        event.payload.title === "read_file" &&
+        String(event.payload.detail).includes("lines 1-2"),
+    );
+    expect(completedRead.type).toBe("item.completed");
+
+    const skippedRepeat = await takeRuntimeEvent(
+      rt.events,
+      (event) =>
+        event.type === "item.completed" &&
+        String(event.payload.detail).includes("Repeated identical tool call skipped"),
+    );
+    expect(skippedRepeat.type).toBe("item.completed");
+
+    const final = await takeRuntimeEvent(
+      rt.events,
+      (event) => event.type === "content.delta" && event.payload.delta === "done",
+    );
+    expect(final.type).toBe("content.delta");
   });
 
   it("rejects ambiguous edits, validates patch paths, checkpoints and rolls back", async () => {

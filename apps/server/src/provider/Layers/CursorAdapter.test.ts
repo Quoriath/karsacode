@@ -18,7 +18,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
-import { ServerSettingsService } from "../../serverSettings.ts";
+import { ServerSettingsService, type ServerSettingsShape } from "../../serverSettings.ts";
 import type { CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { makeCursorAdapter } from "./CursorAdapter.ts";
 
@@ -111,20 +111,19 @@ async function waitForFileContent(filePath: string, attempts = 40) {
 // `ServerSettingsService.getSettings` makes each session read the latest
 // snapshot, matching the old "always read live" behavior that these
 // tests assumed.
-const makeResolveCursorSettings = Effect.gen(function* () {
-  const serverSettings = yield* ServerSettingsService;
-  return serverSettings.getSettings.pipe(
+const resolveCursorSettingsFrom = (serverSettings: ServerSettingsShape) =>
+  serverSettings.getSettings.pipe(
     Effect.map((snapshot) => snapshot.providers.cursor),
     Effect.orDie,
   );
-});
 
 const cursorAdapterTestLayer = it.layer(
   Layer.effect(
     CursorAdapter,
     Effect.gen(function* () {
       const cursorConfig = Schema.decodeSync(CursorSettings)({});
-      const resolveSettings = yield* makeResolveCursorSettings;
+      const serverSettings = yield* ServerSettingsService;
+      const resolveSettings = resolveCursorSettingsFrom(serverSettings);
       return yield* makeCursorAdapter(cursorConfig, { resolveSettings });
     }),
   ).pipe(
@@ -599,7 +598,8 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
             CursorAdapter,
             Effect.gen(function* () {
               const cursorConfig = Schema.decodeSync(CursorSettings)({});
-              const resolveSettings = yield* makeResolveCursorSettings;
+              const serverSettings = yield* ServerSettingsService;
+              const resolveSettings = resolveCursorSettingsFrom(serverSettings);
               return yield* makeCursorAdapter(cursorConfig, { resolveSettings });
             }),
           ).pipe(
@@ -1231,7 +1231,8 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         CursorAdapter,
         Effect.gen(function* () {
           const cursorConfig = Schema.decodeSync(CursorSettings)({});
-          const resolveSettings = yield* makeResolveCursorSettings;
+          const serverSettings = yield* ServerSettingsService;
+          const resolveSettings = resolveCursorSettingsFrom(serverSettings);
           return yield* makeCursorAdapter(cursorConfig, {
             instanceId: customInstanceId,
             resolveSettings,

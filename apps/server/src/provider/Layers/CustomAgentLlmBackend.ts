@@ -20,6 +20,8 @@ export interface CustomAgentLlmOutput {
 export interface CustomAgentLlmBackend {
   readonly complete: (input: CustomAgentLlmInput) => Promise<CustomAgentLlmOutput>;
   readonly stream: (input: CustomAgentLlmInput) => AsyncIterable<string>;
+  readonly getLastUsage?: (() => Record<string, unknown> | undefined) | undefined;
+  readonly getModelContextWindow?: ((model: string) => Promise<number | undefined>) | undefined;
   readonly countTokens?: ((input: CustomAgentLlmInput) => Promise<number>) | undefined;
   readonly supportsNativeToolCalling: boolean;
   readonly supportsJsonMode: boolean;
@@ -33,6 +35,12 @@ export function resolveCustomAgentChatCompletionsUrl(apiBaseUrl: string): string
   const pathname = url.pathname.replace(/\/+$/u, "");
   url.pathname = pathname.endsWith("/chat/completions") ? pathname : `${pathname}/chat/completions`;
   return url.toString();
+}
+
+export function resolveCustomAgentModelsUrl(apiBaseUrl: string): string {
+  const chatUrl = new URL(resolveCustomAgentChatCompletionsUrl(apiBaseUrl));
+  chatUrl.pathname = chatUrl.pathname.replace(/\/chat\/completions$/u, "/models");
+  return chatUrl.toString();
 }
 
 function describeFetchFailure(error: unknown, url: string): string {
@@ -91,6 +99,49 @@ function localAuthFallbackUrls(url: string, apiKey: string): ReadonlyArray<strin
   });
 }
 
+function buildRequestBody(input: CustomAgentLlmInput, stream: boolean): string {
+  const baseBody = {
+    model: input.model,
+    messages: input.messages,
+    temperature: input.temperature ?? 0.2,
+    stream,
+  };
+  return JSON.stringify(
+    stream
+      ? { ...baseBody, stream_options: { include_usage: true } }
+      : { ...baseBody, response_format: { type: "json_object" } },
+  );
+}
+
+type OpenAiCompatibleStreamChunk = {
+  readonly usage?: Record<string, unknown> | null | undefined;
+  readonly choices?: ReadonlyArray<{
+    readonly delta?: { readonly content?: string | null } | undefined;
+    readonly message?: { readonly content?: string | null } | undefined;
+  }>;
+};
+
+function extractOpenAiCompatibleStreamChunk(data: string):
+  | { readonly content?: string | undefined; readonly usage?: Record<string, unknown> | undefined }
+  | undefined {
+  let json: OpenAiCompatibleStreamChunk;
+  try {
+    json = JSON.parse(data) as OpenAiCompatibleStreamChunk;
+  } catch {
+    return undefined;
+  }
+  return {
+    content: json.choices?.[0]?.delta?.content ?? json.choices?.[0]?.message?.content ?? undefined,
+    ...(json.usage && typeof json.usage === "object" ? { usage: json.usage } : {}),
+  };
+}
+
+function normalizeStreamingLine(line: string): string | undefined {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith(":")) return undefined;
+  return trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
+}
+
 export function makeOpenAiCompatibleCustomAgentBackend(
   settings: CustomAgentSettings,
   env: NodeJS.ProcessEnv,
@@ -98,15 +149,10 @@ export function makeOpenAiCompatibleCustomAgentBackend(
   const apiKey =
     settings.apiKey || env[settings.apiKeyEnvVar] || process.env[settings.apiKeyEnvVar];
   const chatCompletionsUrl = resolveCustomAgentChatCompletionsUrl(settings.apiBaseUrl);
+  const modelsUrl = resolveCustomAgentModelsUrl(settings.apiBaseUrl);
   const apiKeyValue = apiKey ?? "";
-  const buildRequestBody = (input: CustomAgentLlmInput, stream: boolean) =>
-    JSON.stringify({
-      model: input.model,
-      messages: input.messages,
-      temperature: input.temperature ?? 0.2,
-      response_format: { type: "json_object" },
-      stream,
-    });
+  let lastUsage: Record<string, unknown> | undefined;
+  const modelContextWindowCache = new Map<string, number | undefined>();
   const post = async (
     url: string,
     authHeaders: Record<string, string>,
@@ -120,6 +166,18 @@ export function makeOpenAiCompatibleCustomAgentBackend(
         ...settings.apiHeaders,
       },
       body,
+    });
+  const getJson = async (
+    url: string,
+    authHeaders: Record<string, string>,
+  ): Promise<Response> =>
+    await fetch(url, {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        ...authHeaders,
+        ...settings.apiHeaders,
+      },
     });
   const postWithLocalAuthFallbacks = async (
     body: string,
@@ -155,7 +213,18 @@ export function makeOpenAiCompatibleCustomAgentBackend(
       throw new Error(describeFetchFailure(error, chatCompletionsUrl), { cause: error });
     }
   };
+  const fetchModels = async (): Promise<Response> => {
+    if (settings.apiKeyRequired && !apiKey)
+      throw new Error(`Missing API key environment variable: ${settings.apiKeyEnvVar}`);
+    try {
+      const authHeaders = buildCustomAgentAuthHeaders(settings, apiKeyValue);
+      return await getJson(modelsUrl, authHeaders);
+    } catch (error) {
+      throw new Error(describeFetchFailure(error, modelsUrl), { cause: error });
+    }
+  };
   const complete = async (input: CustomAgentLlmInput): Promise<CustomAgentLlmOutput> => {
+    lastUsage = undefined;
     const response = await fetchChatCompletions(input, false);
     if (!response.ok)
       throw new Error(
@@ -172,9 +241,23 @@ export function makeOpenAiCompatibleCustomAgentBackend(
         cause: error,
       });
     }
+    lastUsage = json.usage;
     return { content: json.choices?.[0]?.message?.content ?? "", usage: json.usage };
   };
+  const getModelContextWindow = async (model: string): Promise<number | undefined> => {
+    if (modelContextWindowCache.has(model)) return modelContextWindowCache.get(model);
+    const response = await fetchModels().catch(() => undefined);
+    if (!response?.ok) {
+      modelContextWindowCache.set(model, undefined);
+      return undefined;
+    }
+    const json = (await response.json().catch(() => undefined)) as unknown;
+    const contextWindow = extractModelContextWindow(json, model);
+    modelContextWindowCache.set(model, contextWindow);
+    return contextWindow;
+  };
   const stream = async function* (input: CustomAgentLlmInput): AsyncIterable<string> {
+    lastUsage = undefined;
     const response = await fetchChatCompletions(input, true);
     if (!response.ok)
       throw new Error(
@@ -184,6 +267,19 @@ export function makeOpenAiCompatibleCustomAgentBackend(
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    const processLine = function* (line: string): Generator<string, boolean> {
+      const data = normalizeStreamingLine(line);
+      if (!data) return false;
+      if (data === "[DONE]") return true;
+      const chunk = extractOpenAiCompatibleStreamChunk(data);
+      if (chunk?.usage) lastUsage = chunk.usage;
+      if (chunk?.content) {
+        yield chunk.content;
+        return false;
+      }
+      if (!line.trim().startsWith("data:")) yield data;
+      return false;
+    };
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -191,29 +287,36 @@ export function makeOpenAiCompatibleCustomAgentBackend(
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() ?? "";
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith(":")) continue;
-        const data = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
-        if (data === "[DONE]") return;
-        let json: {
-          choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>;
-        };
-        try {
-          json = JSON.parse(data) as typeof json;
-        } catch {
-          continue;
+        const chunks = processLine(line);
+        while (true) {
+          const next = chunks.next();
+          if (next.done) {
+            if (next.value) return;
+            break;
+          }
+          yield next.value;
         }
-        const content = json.choices?.[0]?.delta?.content ?? json.choices?.[0]?.message?.content;
-        if (content) yield content;
       }
     }
     const trailing = decoder.decode();
     if (trailing) buffer += trailing;
-    if (buffer.trim() && !buffer.trim().startsWith("data:")) yield buffer.trim();
+    for (const line of buffer.split(/\r?\n/)) {
+      const chunks = processLine(line);
+      while (true) {
+        const next = chunks.next();
+        if (next.done) {
+          if (next.value) return;
+          break;
+        }
+        yield next.value;
+      }
+    }
   };
   return {
     complete,
     stream,
+    getLastUsage: () => lastUsage,
+    getModelContextWindow,
     countTokens: async (input) =>
       Math.ceil(input.messages.map((message) => message.content).join("\n").length / 4),
     supportsNativeToolCalling: false,

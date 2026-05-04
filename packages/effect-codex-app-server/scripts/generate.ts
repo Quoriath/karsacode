@@ -162,11 +162,9 @@ const fetchText = Effect.fn("fetchText")(function* (url: string) {
       try: () => response.text(),
       catch: () => "",
     });
-    return yield* Effect.fail(
-      new GeneratorError({
-        detail: `Failed to download ${url}: ${response.status} ${detail}`,
-      }),
-    );
+    return yield* new GeneratorError({
+      detail: `Failed to download ${url}: ${response.status} ${detail}`,
+    });
   }
 
   return yield* Effect.tryPromise({
@@ -548,7 +546,7 @@ const generateFiles = Effect.fn("generateFiles")(function* () {
 
   for (const file of jsonSchemaFiles) {
     const raw = yield* fetchText(file.downloadUrl);
-    const parsed = JSON.parse(raw) as {
+    const parsed = (yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))(raw)) as {
       readonly definitions?: Record<string, typeof Schema.Json.Type>;
     } & Record<string, typeof Schema.Json.Type>;
     const localDefinitionNames = new Map(

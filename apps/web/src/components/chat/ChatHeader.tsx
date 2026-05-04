@@ -17,6 +17,8 @@ import { Toggle } from "../ui/toggle";
 import { SidebarTrigger } from "../ui/sidebar";
 import { OpenInPicker } from "./OpenInPicker";
 import { usePrimaryEnvironmentId } from "../../environments/primary";
+import { type ContextWindowSnapshot } from "~/lib/contextWindow";
+import { ContextWindowMeter } from "./ContextWindowMeter";
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -34,6 +36,7 @@ interface ChatHeaderProps {
   terminalOpen: boolean;
   terminalToggleShortcutLabel: string | null;
   diffToggleShortcutLabel: string | null;
+  activeContextWindow: ContextWindowSnapshot | null;
   gitCwd: string | null;
   diffOpen: boolean;
   onRunProjectScript: (script: ProjectScript) => void;
@@ -60,6 +63,7 @@ export const ChatHeader = memo(function ChatHeader({
   terminalOpen,
   terminalToggleShortcutLabel,
   diffToggleShortcutLabel,
+  activeContextWindow,
   gitCwd,
   diffOpen,
   onRunProjectScript,
@@ -95,6 +99,7 @@ export const ChatHeader = memo(function ChatHeader({
         )}
       </div>
       <div className="flex shrink-0 items-center justify-end gap-2 @3xl/header-actions:gap-3">
+        <ContextWindowMeter usage={activeContextWindow} variant="pill" />
         {activeProjectScripts && (
           <ProjectScriptsControl
             scripts={activeProjectScripts}

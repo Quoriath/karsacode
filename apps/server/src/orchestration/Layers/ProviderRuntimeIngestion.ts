@@ -7,6 +7,7 @@ import {
   type OrchestrationProposedPlanId,
   CheckpointRef,
   isToolLifecycleItemType,
+  ProviderDriverKind,
   ThreadId,
   type ThreadTokenUsageSnapshot,
   TurnId,
@@ -46,6 +47,7 @@ const BUFFERED_PROPOSED_PLAN_BY_ID_CACHE_CAPACITY = 10_000;
 const BUFFERED_PROPOSED_PLAN_BY_ID_TTL = Duration.minutes(120);
 const MAX_BUFFERED_ASSISTANT_CHARS = 24_000;
 const STRICT_PROVIDER_LIFECYCLE_GUARD = process.env.T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD !== "0";
+const CUSTOM_AGENT_PROVIDER = ProviderDriverKind.make("customAgent");
 
 type TurnStartRequestedDomainEvent = Extract<
   OrchestrationEvent,
@@ -749,6 +751,13 @@ const make = Effect.gen(function* () {
   const clearAssistantMessageState = (messageId: MessageId) =>
     clearBufferedAssistantText(messageId);
 
+  const resolveAssistantDeliveryMode = (event: ProviderRuntimeEvent) =>
+    event.provider === CUSTOM_AGENT_PROVIDER
+      ? Effect.succeed<AssistantDeliveryMode>("streaming")
+      : Effect.map(serverSettingsService.getSettings, (settings) =>
+          settings.enableAssistantStreaming ? "streaming" : "buffered",
+        );
+
   const flushBufferedAssistantMessage = (input: {
     event: ProviderRuntimeEvent;
     threadId: ThreadId;
@@ -1242,10 +1251,7 @@ const make = Effect.gen(function* () {
           yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
         }
 
-        const assistantDeliveryMode: AssistantDeliveryMode = yield* Effect.map(
-          serverSettingsService.getSettings,
-          (settings) => (settings.enableAssistantStreaming ? "streaming" : "buffered"),
-        );
+        const assistantDeliveryMode = yield* resolveAssistantDeliveryMode(event);
         if (assistantDeliveryMode === "buffered") {
           const spillChunk = yield* appendBufferedAssistantText(assistantMessageId, assistantDelta);
           if (spillChunk.length > 0) {
@@ -1277,10 +1283,7 @@ const make = Effect.gen(function* () {
           ? toTurnId(event.turnId)
           : undefined;
       if (pauseForUserTurnId) {
-        const assistantDeliveryMode: AssistantDeliveryMode = yield* Effect.map(
-          serverSettingsService.getSettings,
-          (settings) => (settings.enableAssistantStreaming ? "streaming" : "buffered"),
-        );
+        const assistantDeliveryMode = yield* resolveAssistantDeliveryMode(event);
         const flushedMessageIds =
           assistantDeliveryMode === "buffered"
             ? yield* flushBufferedAssistantMessagesForTurn({

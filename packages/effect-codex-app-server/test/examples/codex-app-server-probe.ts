@@ -1,10 +1,14 @@
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 import * as CodexClient from "../../src/client.ts";
+
+const JsonString = Schema.fromJsonString(Schema.Unknown);
+const encodeJson = Schema.encodeSync(JsonString);
 
 const program = Effect.gen(function* () {
   const codexLayer = CodexClient.layerCommand({
@@ -45,17 +49,17 @@ const program = Effect.gen(function* () {
         optOutNotificationMethods: null,
       },
     });
-    yield* Console.log("initialize", JSON.stringify(initialized, null, 2));
+    yield* Console.log("initialize", encodeJson(initialized));
 
     yield* client.notify("initialized", undefined);
 
     const account = yield* client.request("account/read", {});
-    yield* Console.log("account/read", JSON.stringify(account, null, 2));
+    yield* Console.log("account/read", encodeJson(account));
 
     const skills = yield* client.request("skills/list", {
       cwds: [process.cwd()],
     });
-    yield* Console.log("skills/list", JSON.stringify(skills, null, 2));
+    yield* Console.log("skills/list", encodeJson(skills));
   }).pipe(Effect.provide(codexLayer));
 });
 
