@@ -195,7 +195,10 @@ function compactTestOutput(text: string): string {
   const suiteSummary = [...suites.entries()]
     .map(([name, { pass, fail }]) => `${name}: ${pass} pass, ${fail} fail`)
     .join("\n");
-  if (failures.length === 0) return `All tests passed.\n${suiteSummary}`;
+  if (failures.length === 0) {
+    if (suiteSummary.length === 0) return text;
+    return `All tests passed.\n${suiteSummary}`;
+  }
   return [
     `Test failures: ${failures.length}`,
     suiteSummary,

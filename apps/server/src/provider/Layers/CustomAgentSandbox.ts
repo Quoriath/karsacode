@@ -164,6 +164,7 @@ export async function runCustomAgentCommand(input: {
   readonly timeoutMs?: number | undefined;
   readonly maxOutputBytes?: number | undefined;
   readonly env?: Record<string, string> | undefined;
+  readonly signal?: AbortSignal | undefined;
 }): Promise<CustomAgentCommandResult> {
   const risk = classifyCustomAgentCommand(input.settings, input.command);
   if (risk.blocked) throw new CustomAgentPolicyError(`Command blocked: ${risk.reasons.join(" ")}`);
@@ -177,6 +178,7 @@ export async function runCustomAgentCommand(input: {
       timeout: input.timeoutMs ?? input.settings.commandTimeoutMs,
       maxBuffer: input.maxOutputBytes ?? input.settings.maxToolOutputBytes,
       windowsHide: true,
+      signal: input.signal,
     });
     const stdoutReduced = reduceCustomAgentOutput({
       raw: result.stdout,

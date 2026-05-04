@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import type {
   CustomAgentSettings,
   ProviderApprovalDecision,
@@ -15,10 +16,15 @@ import {
   ProviderDriverKind,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
   TurnId,
 } from "@t3tools/contracts";
 import { Effect, Queue } from "effect";
-import type { CustomAgentLlmBackend, CustomAgentChatMessage } from "./CustomAgentLlmBackend.ts";
+import type {
+  CustomAgentLlmBackend,
+  CustomAgentChatMessage,
+  CustomAgentModelToolCall,
+} from "./CustomAgentLlmBackend.ts";
 import { parseCustomAgentModelCommand } from "./CustomAgentLlmBackend.ts";
 import { buildCustomAgentRuntimePrompt, loadCustomAgentSystemPrompt } from "./CustomAgentPrompt.ts";
 import {
@@ -29,6 +35,7 @@ import {
   makeCustomAgentToolRegistry,
   type CustomAgentApprovalRequest,
   type CustomAgentToolRegistry,
+  type CustomAgentToolResult,
 } from "./CustomAgentTools.ts";
 
 const PROVIDER = ProviderDriverKind.make("customAgent");
@@ -40,6 +47,95 @@ const CONTEXT_COMPACT_FORCE_RATIO = 0.96;
 const CONTEXT_COMPACT_RECENT_MESSAGES = 8;
 const CONTEXT_COMPACT_MIN_MESSAGES = 12;
 const CONTEXT_COMPACT_MAX_SUMMARIES = 5;
+const MAX_SUBAGENTS_PER_CALL = 8;
+const MAX_ACTIVE_SUBAGENTS_PER_SESSION = 16;
+const SUBAGENT_RECENT_MESSAGES = 10;
+const SUBAGENT_MAX_OUTPUT_TOKENS = 1600;
+const SUBAGENT_WAIT_TIMEOUT_MS = 120_000;
+const MAX_TODO_ITEMS = 12;
+const MAX_TODO_TEXT_LENGTH = 180;
+const TODO_REQUIRED_MIN_CHARS = 90;
+const TODO_REQUIRED_KEYWORDS = [
+  "analyze",
+  "audit",
+  "bug",
+  "debug",
+  "develop",
+  "implement",
+  "improve",
+  "investigate",
+  "plan",
+  "refactor",
+  "review",
+  "cek",
+  "analisis",
+  "audit",
+  "bug",
+  "debug",
+  "fitur",
+  "implementasi",
+  "kembangkan",
+  "lanjutkan",
+  "perbaiki",
+  "project",
+  "proyek",
+  "prompt",
+  "sistem",
+  "tambahkan",
+  "tools",
+] as const;
+const SUBAGENT_NAMES = [
+  "Aether",
+  "Orion",
+  "Atlas",
+  "Zephyr",
+  "Lykos",
+  "Aster",
+  "Eryx",
+  "Helios",
+  "Nikos",
+  "Xander",
+  "Theron",
+  "Damon",
+  "Leonidas",
+  "Evander",
+  "Kairos",
+  "Castor",
+  "Ares",
+  "Cygnus",
+  "Leander",
+  "Dorian",
+  "Kael",
+  "Zyren",
+  "Veyr",
+  "Auron",
+  "Nox",
+  "Riven",
+  "Soren",
+  "Draven",
+  "Vael",
+  "Kyros",
+  "Axion",
+  "Eryon",
+  "Zarek",
+  "Lucien",
+  "Rhaen",
+  "Varyn",
+  "Azrael",
+  "Kieran",
+  "Sylas",
+  "Caelum",
+  "Nyron",
+  "Zevan",
+  "Aurel",
+  "Orien",
+  "Draxen",
+  "Valen",
+  "Ezren",
+  "Kairox",
+  "Thorne",
+  "Astrael",
+] as const;
 
 function formatCustomAgentRuntimeError(error: unknown): string {
   const message = String((error as Error).message ?? error);
@@ -48,6 +144,39 @@ function formatCustomAgentRuntimeError(error: unknown): string {
     message.startsWith("Custom Agent API returned invalid JSON")
     ? message
     : `Custom Agent runtime error: ${message}`;
+}
+
+function throwIfSignalAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw new DOMException("Aborted", "AbortError");
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  const message = String((error as Error).message ?? error);
+  const name = String((error as Error).name ?? "");
+  return name === "AbortError" || /\b(aborted|interrupted|turn interrupted)\b/i.test(message);
+}
+
+function isRetryableRuntimeError(error: unknown): boolean {
+  if (isAbortLikeError(error)) return false;
+  const message = String((error as Error).message ?? error);
+  return (
+    /\b(timeout|timed out|econnreset|econnrefused|socket|fetch failed|network|rate limit|429|500|502|503|504)\b/i.test(
+      message,
+    ) || message.trim().length === 0
+  );
+}
+
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(resolve, ms);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function stableJson(value: unknown): string {
@@ -76,6 +205,95 @@ function countArrayField(value: unknown): number | undefined {
   return Array.isArray(value) ? value.length : undefined;
 }
 
+function sliceArrayField<T extends Record<string, unknown>>(
+  object: T,
+  key: string,
+  limit: number,
+): T {
+  const value = object[key];
+  return Array.isArray(value) ? { ...object, [key]: value.slice(0, limit) } : object;
+}
+
+function compactToolJsonForModel(tool: string, parsed: Record<string, unknown>): unknown {
+  if (typeof parsed.preview === "string")
+    return { ...parsed, preview: parsed.preview.slice(0, 1200) };
+
+  if (tool === "code_navigation") {
+    const outlines = Array.isArray(parsed.outlines)
+      ? parsed.outlines.slice(0, 6).map((outline) => {
+          if (!outline || typeof outline !== "object") return outline;
+          const record = outline as Record<string, unknown>;
+          return {
+            ...record,
+            symbols: Array.isArray(record.symbols) ? record.symbols.slice(0, 14) : record.symbols,
+            suggestedReads: Array.isArray(record.suggestedReads)
+              ? record.suggestedReads.slice(0, 6)
+              : record.suggestedReads,
+          };
+        })
+      : parsed.outlines;
+    const lexicalMatches =
+      parsed.lexicalMatches && typeof parsed.lexicalMatches === "object"
+        ? sliceArrayField(
+            sliceArrayField(parsed.lexicalMatches as Record<string, unknown>, "snippets", 8),
+            "suggestedReads",
+            8,
+          )
+        : parsed.lexicalMatches;
+    return { ...parsed, lexicalMatches, outlines };
+  }
+
+  if (tool === "project_map")
+    return {
+      ...parsed,
+      keyFiles: Array.isArray(parsed.keyFiles) ? parsed.keyFiles.slice(0, 24) : parsed.keyFiles,
+      folders: Array.isArray(parsed.folders) ? parsed.folders.slice(0, 12) : parsed.folders,
+      extensions: Array.isArray(parsed.extensions)
+        ? parsed.extensions.slice(0, 12)
+        : parsed.extensions,
+    };
+
+  if (tool === "list_files") return sliceArrayField(parsed, "files", 80);
+
+  if (tool === "find_files") return sliceArrayField(parsed, "files", 60);
+
+  if (tool === "search_repo")
+    return sliceArrayField(sliceArrayField(parsed, "snippets", 12), "suggestedReads", 12);
+
+  if (tool === "web_search")
+    return {
+      ...parsed,
+      results: Array.isArray(parsed.results)
+        ? parsed.results.slice(0, 6).map((result) => {
+            if (!result || typeof result !== "object") return result;
+            const record = result as Record<string, unknown>;
+            return {
+              ...record,
+              text: typeof record.text === "string" ? record.text.slice(0, 800) : record.text,
+            };
+          })
+        : parsed.results,
+    };
+
+  if (tool === "web_fetch")
+    return {
+      ...parsed,
+      pages: Array.isArray(parsed.pages)
+        ? parsed.pages.slice(0, 3).map((page) => {
+            if (!page || typeof page !== "object") return page;
+            const record = page as Record<string, unknown>;
+            return {
+              ...record,
+              text: typeof record.text === "string" ? record.text.slice(0, 1200) : record.text,
+            };
+          })
+        : parsed.pages,
+      failures: Array.isArray(parsed.failures) ? parsed.failures.slice(0, 5) : parsed.failures,
+    };
+
+  return parsed;
+}
+
 function formatToolActivityDetail(tool: string, result: { ok: boolean; content: string }): string {
   const parsed = parseToolJson(result.content);
   if (!parsed) return result.content.slice(0, 500);
@@ -91,10 +309,73 @@ function formatToolActivityDetail(tool: string, result: { ok: boolean; content: 
   if (fileCount !== undefined) parts.push(`${fileCount} files`);
   const snippetCount = countArrayField(parsed.snippets);
   if (snippetCount !== undefined) parts.push(`${snippetCount} matches`);
+  const resultCount = countArrayField(parsed.results);
+  if (resultCount !== undefined) parts.push(`${resultCount} results`);
+  const pageCount = countArrayField(parsed.pages);
+  if (pageCount !== undefined) parts.push(`${pageCount} pages`);
+  const failureCount = countArrayField(parsed.failures);
+  if (failureCount !== undefined && failureCount > 0) parts.push(`${failureCount} failures`);
+  if (typeof parsed.query === "string") parts.push(parsed.query);
+  const keyFileCount = countArrayField(parsed.keyFiles);
+  if (keyFileCount !== undefined) parts.push(`${keyFileCount} key files`);
+  const outlineCount = countArrayField(parsed.outlines);
+  if (outlineCount !== undefined) parts.push(`${outlineCount} candidates`);
+  if (parsed.fileMatches && typeof parsed.fileMatches === "object") {
+    const totalMatches = (parsed.fileMatches as Record<string, unknown>).totalMatches;
+    if (typeof totalMatches === "number") parts.push(`${totalMatches} file matches`);
+  }
+  if (parsed.lexicalMatches && typeof parsed.lexicalMatches === "object") {
+    const totalMatches = (parsed.lexicalMatches as Record<string, unknown>).totalMatches;
+    if (typeof totalMatches === "number") parts.push(`${totalMatches} lexical matches`);
+  }
+  if (typeof parsed.candidates === "number") parts.push(`${parsed.candidates} candidates`);
+  if (typeof parsed.lexicalMatches === "number") parts.push(`${parsed.lexicalMatches} lexical`);
   if (typeof parsed.exitCode === "number") parts.push(`exit ${parsed.exitCode}`);
   if (typeof parsed.artifactId === "string") parts.push(`artifact ${parsed.artifactId}`);
   if (parsed.truncated === true) parts.push("truncated");
   return parts.join(" | ").slice(0, 500);
+}
+
+function itemTypeForTool(tool: string) {
+  return tool === "run_command"
+    ? "command_execution"
+    : tool === "web_search" || tool === "web_fetch"
+      ? "web_search"
+      : tool.includes("mcp")
+        ? "mcp_tool_call"
+        : ["write_file", "edit_file", "delete_file", "apply_patch"].includes(tool)
+          ? "file_change"
+          : "dynamic_tool_call";
+}
+
+const CONCURRENT_SAFE_TOOLS = new Set([
+  "read_file",
+  "todo_read",
+  "code_navigation",
+  "project_map",
+  "file_outline",
+  "search_repo",
+  "find_files",
+  "semantic_search",
+  "web_search",
+  "web_fetch",
+  "list_files",
+  "project_context",
+  "git_status",
+  "git_diff",
+  "working_tree_summary",
+  "subagent_status",
+  "list_checkpoints",
+  "retrieve_artifact",
+  "search_artifacts",
+  "summarize_artifact",
+  "mcp_list_servers",
+  "mcp_list_tools",
+  "skill_list",
+]);
+
+function canRunToolCallsConcurrently(calls: ReadonlyArray<CustomAgentModelToolCall>): boolean {
+  return calls.length > 1 && calls.every((call) => CONCURRENT_SAFE_TOOLS.has(call.tool));
 }
 
 function formatToolResultForModel(input: {
@@ -103,10 +384,9 @@ function formatToolResultForModel(input: {
   readonly content: string;
 }): string {
   const parsed = parseToolJson(input.content);
-  const result =
-    parsed && typeof parsed.preview === "string"
-      ? { ...parsed, preview: parsed.preview.slice(0, 1200) }
-      : (parsed ?? input.content.slice(0, 1600));
+  const result = parsed
+    ? compactToolJsonForModel(input.tool, parsed)
+    : input.content.slice(0, 1600);
   return `Tool result. Continue immediately: if this is enough, emit {"type":"final","content":"..."} now.\n${JSON.stringify(
     {
       tool: input.tool,
@@ -133,6 +413,51 @@ function isPassiveUnverifiedProjectAnswer(content: string): boolean {
     /saya bisa.*(cek|lihat|baca)/.test(normalized) ||
     /i can.*(check|inspect|read)/.test(normalized)
   );
+}
+
+function isLikelyRawStructuredFileDump(content: string): boolean {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed) as unknown;
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const record = parsed as Record<string, unknown>;
+  const keys = new Set(Object.keys(record));
+  const packageManifestKeys = [
+    "name",
+    "version",
+    "scripts",
+    "dependencies",
+    "devDependencies",
+    "type",
+    "main",
+  ];
+  const packageManifestScore = packageManifestKeys.filter((key) => keys.has(key)).length;
+  return packageManifestScore >= 4;
+}
+
+function chunkAssistantText(content: string): string[] {
+  const chunks: string[] = [];
+  let cursor = 0;
+  while (cursor < content.length) {
+    const remaining = content.length - cursor;
+    const target = remaining > 320 ? 180 : remaining;
+    const slice = content.slice(cursor, cursor + target);
+    const softBreak = Math.max(
+      slice.lastIndexOf("\n"),
+      slice.lastIndexOf(". "),
+      slice.lastIndexOf(", "),
+      slice.lastIndexOf(" "),
+    );
+    const size = softBreak > 80 && remaining > target ? softBreak + 1 : Math.min(target, remaining);
+    chunks.push(content.slice(cursor, cursor + size));
+    cursor += size;
+  }
+  return chunks;
 }
 
 function extractListedFiles(content: string): string[] {
@@ -172,15 +497,46 @@ interface PendingApproval {
   readonly resolve: (decision: ProviderApprovalDecision) => void;
 }
 
+type CustomAgentSubagentStatus = "running" | "completed" | "failed" | "cancelled";
+type CustomAgentTodoStatus = "pending" | "in_progress" | "completed" | "blocked";
+
+interface CustomAgentTodoItem {
+  readonly id: string;
+  readonly content: string;
+  readonly status: CustomAgentTodoStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+interface CustomAgentSubagentTask {
+  readonly id: string;
+  readonly name: string;
+  readonly task: string;
+  readonly wait: boolean;
+  readonly turnId: TurnId;
+  readonly itemId: string;
+  readonly createdAt: string;
+  readonly abort: AbortController;
+  status: CustomAgentSubagentStatus;
+  completedAt?: string | undefined;
+  result?: string | undefined;
+  error?: string | undefined;
+  promise?: Promise<CustomAgentSubagentTask> | undefined;
+}
+
 interface CustomAgentSessionState {
   session: ProviderSession;
   readonly messages: CustomAgentChatMessage[];
   readonly compactedHistorySummaries: string[];
   activeTurnId?: TurnId | undefined;
   activeAbort?: AbortController | undefined;
+  activeAssistantItemId?: string | undefined;
   readonly pendingApprovals: Map<string, PendingApproval>;
   readonly pendingUserInputRequests: Map<string, unknown>;
   readonly activeToolCalls: Map<string, unknown>;
+  readonly subagents: Map<string, CustomAgentSubagentTask>;
+  readonly todos: Map<string, CustomAgentTodoItem>;
+  readonly settledTurnIds: Set<TurnId>;
   readonly toolArtifacts: string[];
   readonly contextReferences: string[];
   readonly currentDiffs: string[];
@@ -192,6 +548,8 @@ interface CustomAgentSessionState {
   tokenUsageEstimate: number;
   lastCompactionMessageCount: number;
   projectContextInjected: boolean;
+  subagentNameCursor: number;
+  todoTaskId?: RuntimeTaskId | undefined;
   readonly turns: Array<{ id: TurnId; items: unknown[] }>;
 }
 
@@ -544,6 +902,7 @@ async function completeCustomAgentModel(
     readonly messages: ReadonlyArray<CustomAgentChatMessage>;
     readonly model: string;
     readonly maxOutputTokens?: number | undefined;
+    readonly signal?: AbortSignal | undefined;
   },
   onFinalContentDelta?: ((delta: string) => Promise<void>) | undefined,
 ): Promise<{ content: string; usage?: Record<string, unknown> }> {
@@ -569,11 +928,13 @@ async function completeCustomAgentModel(
 
   let streamFailed = false;
   try {
+    throwIfSignalAborted(input.signal);
     for await (const chunk of backend.stream({
       ...input,
       stream: true,
       maxOutputTokens: input.maxOutputTokens,
     })) {
+      throwIfSignalAborted(input.signal);
       streamed += chunk;
       const finalContentPrefix = extractStreamingContentPrefix(streamed);
       if (
@@ -590,20 +951,28 @@ async function completeCustomAgentModel(
     if (backend.getLastUsage) {
       streamUsage = backend.getLastUsage();
     }
-  } catch {
+  } catch (error) {
+    if (input.signal?.aborted) throw error;
     streamFailed = true;
     streamed = "";
   }
+  throwIfSignalAborted(input.signal);
   await drainFinalContentDeltas();
   if (!streamFailed && streamed.trim().length > 0) {
-    return { content: streamed, usage: streamUsage };
+    return {
+      content: streamed,
+      ...(streamUsage !== undefined ? { usage: streamUsage } : {}),
+    };
   }
   const completeResult = await backend.complete({
     ...input,
     stream: false,
     maxOutputTokens: input.maxOutputTokens,
   });
-  return { content: completeResult.content, usage: completeResult.usage };
+  return {
+    content: completeResult.content,
+    ...(completeResult.usage !== undefined ? { usage: completeResult.usage } : {}),
+  };
 }
 
 export async function makeCustomAgentRuntime(input: {
@@ -612,22 +981,43 @@ export async function makeCustomAgentRuntime(input: {
   readonly workspaceRoot: string;
   readonly backend: CustomAgentLlmBackend;
   readonly events: Queue.Queue<ProviderRuntimeEvent>;
+  readonly environment?: NodeJS.ProcessEnv | undefined;
 }): Promise<CustomAgentRuntime> {
   const events = input.events;
   const sessions = new Map<ThreadId, CustomAgentSessionState>();
   const contextStore = makeCustomAgentContextStore();
-  const tools = makeCustomAgentToolRegistry({
+  const defaultTools = makeCustomAgentToolRegistry({
     settings: input.settings,
     workspaceRoot: input.workspaceRoot,
     contextStore,
+    environment: input.environment,
   });
+  const toolRegistries = new Map<string, CustomAgentToolRegistry>([
+    [path.resolve(input.workspaceRoot), defaultTools],
+  ]);
+  const toolsForWorkspace = (workspaceRoot: string): CustomAgentToolRegistry => {
+    const resolved = path.resolve(workspaceRoot || input.workspaceRoot);
+    const existing = toolRegistries.get(resolved);
+    if (existing) return existing;
+    const registry = makeCustomAgentToolRegistry({
+      settings: input.settings,
+      workspaceRoot: resolved,
+      contextStore,
+      checkpointStore: defaultTools.checkpointStore,
+      environment: input.environment,
+    });
+    toolRegistries.set(resolved, registry);
+    return registry;
+  };
+  const workspaceRootForSession = (state: CustomAgentSessionState): string =>
+    path.resolve(state.session.cwd || input.workspaceRoot);
   const systemPrompt = await loadCustomAgentSystemPrompt(input.settings, input.workspaceRoot).catch(
     () =>
       loadCustomAgentSystemPrompt({ ...input.settings, systemPromptPath: "" }, input.workspaceRoot),
   );
   const runtimePrompt = buildCustomAgentRuntimePrompt({
     systemPrompt,
-    toolNames: tools.names,
+    toolNames: defaultTools.names,
     mcpEnabled: input.settings.mcpEnabled,
     checkpointEnabled: input.settings.checkpointEnabled,
     semanticSearchEnabled: input.settings.semanticSearchEnabled,
@@ -649,10 +1039,712 @@ export async function makeCustomAgentRuntime(input: {
     } as ProviderRuntimeEvent);
   }
 
+  async function completeModelWithRetry(inputState: {
+    readonly state: CustomAgentSessionState;
+    readonly turnId: TurnId;
+    readonly messages: ReadonlyArray<CustomAgentChatMessage>;
+    readonly model: string;
+    readonly maxOutputTokens?: number | undefined;
+    readonly onFinalContentDelta?: ((delta: string) => Promise<void>) | undefined;
+  }): Promise<Awaited<ReturnType<typeof completeCustomAgentModel>>> {
+    const attempts = 2;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      assertTurnOpen(inputState.state, inputState.turnId);
+      try {
+        return await completeCustomAgentModel(
+          input.backend,
+          {
+            messages: inputState.messages,
+            model: inputState.model,
+            maxOutputTokens: inputState.maxOutputTokens,
+            signal: inputState.state.activeAbort?.signal,
+          },
+          inputState.onFinalContentDelta,
+        );
+      } catch (error) {
+        lastError = error;
+        if (
+          inputState.state.activeAbort?.signal.aborted ||
+          isTurnSettled(inputState.state, inputState.turnId) ||
+          attempt >= attempts ||
+          !isRetryableRuntimeError(error)
+        ) {
+          throw error;
+        }
+        const message = formatCustomAgentRuntimeError(error);
+        await emit({
+          type: "runtime.warning",
+          ...eventBase({
+            instanceId: input.instanceId,
+            threadId: inputState.state.session.threadId,
+            turnId: inputState.turnId,
+          }),
+          payload: {
+            message: `${message}; retrying model response (${attempt}/${attempts - 1})`,
+            detail: { attempt, attempts },
+          },
+        } as ProviderRuntimeEvent);
+        await sleep(450 * attempt, inputState.state.activeAbort?.signal);
+      }
+    }
+    throw lastError;
+  }
+
   function getSession(threadId: ThreadId): CustomAgentSessionState {
     const session = sessions.get(threadId);
     if (!session) throw new Error(`Unknown CustomAgent thread: ${threadId}`);
     return session;
+  }
+
+  function isTurnSettled(state: CustomAgentSessionState, turnId: TurnId): boolean {
+    return state.settledTurnIds.has(turnId);
+  }
+
+  function assertTurnOpen(state: CustomAgentSessionState, turnId: TurnId): void {
+    if (isTurnSettled(state, turnId) || state.activeAbort?.signal.aborted) {
+      throw new Error("Turn interrupted.");
+    }
+  }
+
+  function isSubagentTool(tool: string): boolean {
+    return tool === "subagent_spawn" || tool === "subagent_status" || tool === "subagent_wait";
+  }
+
+  function isTodoTool(tool: string): boolean {
+    return tool === "todo_write" || tool === "todo_read";
+  }
+
+  function todoItemsForUi(state: CustomAgentSessionState): ReadonlyArray<Record<string, string>> {
+    return [...state.todos.values()].map((item) => ({
+      id: item.id,
+      content: item.content,
+      status: item.status,
+      updatedAt: item.updatedAt,
+    }));
+  }
+
+  function todoCounts(state: CustomAgentSessionState): Record<CustomAgentTodoStatus, number> {
+    const counts: Record<CustomAgentTodoStatus, number> = {
+      pending: 0,
+      in_progress: 0,
+      completed: 0,
+      blocked: 0,
+    };
+    for (const item of state.todos.values()) counts[item.status] += 1;
+    return counts;
+  }
+
+  function todoSummaryLine(state: CustomAgentSessionState): string {
+    const counts = todoCounts(state);
+    const total = state.todos.size;
+    const active = [...state.todos.values()].find((item) => item.status === "in_progress");
+    const suffix = active ? ` - ${active.content}` : "";
+    return `Todo ${counts.completed}/${total} done${counts.blocked ? `, ${counts.blocked} blocked` : ""}${suffix}`;
+  }
+
+  function openTodoItems(state: CustomAgentSessionState): ReadonlyArray<CustomAgentTodoItem> {
+    return [...state.todos.values()].filter((item) => item.status !== "completed");
+  }
+
+  function shouldRequireTodoForUserInput(userInput: string): boolean {
+    const normalized = userInput.toLowerCase();
+    if (normalized.length >= TODO_REQUIRED_MIN_CHARS) return true;
+    if (normalized.includes("\n")) return true;
+    return TODO_REQUIRED_KEYWORDS.some((keyword) => normalized.includes(keyword));
+  }
+
+  function buildTodoRuntimeHint(
+    state: CustomAgentSessionState,
+    userInput: string,
+  ): string | undefined {
+    const openItems = openTodoItems(state);
+    const requiresTodo = shouldRequireTodoForUserInput(userInput);
+    if (!requiresTodo && openItems.length === 0) return undefined;
+
+    const lines = [
+      "Todo discipline:",
+      "- Use todo_write for any multi-step, code-editing, debugging, audit, project-analysis, or medium+ task.",
+      "- Keep exactly one main item in_progress unless independent subagents are running.",
+      "- Before a final answer, todo statuses must reflect reality: completed, blocked, or still pending with a reason.",
+      "- If a tool result changes the next step, update todo_write before continuing.",
+    ];
+    if (state.todos.size === 0) {
+      lines.push(
+        "- This request appears to need visible planning and no todo exists yet; create a compact 2-7 item todo_write before other non-automatic work unless the task is truly one-shot.",
+      );
+    } else {
+      lines.push(`- Current ${todoSummaryLine(state)}.`);
+      for (const item of openItems.slice(0, 5)) {
+        lines.push(`  - ${item.status}: ${item.content}`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  async function emitTodoList(
+    state: CustomAgentSessionState,
+    turnId: TurnId,
+    reason: string,
+  ): Promise<void> {
+    if (!state.todoTaskId) state.todoTaskId = RuntimeTaskId.make(`todo_${randomUUID()}`);
+    await emit({
+      type: "task.progress",
+      ...eventBase({
+        instanceId: input.instanceId,
+        threadId: state.session.threadId,
+        turnId,
+      }),
+      payload: {
+        taskId: state.todoTaskId,
+        description: todoSummaryLine(state),
+        summary: "Todo plan",
+        metadata: {
+          kind: "todo_list",
+          reason,
+          counts: todoCounts(state),
+          items: todoItemsForUi(state),
+        },
+      },
+    } as ProviderRuntimeEvent);
+  }
+
+  function normalizeTodoStatus(value: unknown): CustomAgentTodoStatus {
+    return value === "in_progress" ||
+      value === "completed" ||
+      value === "blocked" ||
+      value === "pending"
+      ? value
+      : "pending";
+  }
+
+  function normalizeTodoId(value: unknown, content: string): string {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value
+        .trim()
+        .slice(0, 80)
+        .replace(/[^\w.-]+/g, "_");
+    }
+    return `todo_${content
+      .toLowerCase()
+      .replace(/[^\w]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 48)}_${randomUUID().slice(0, 8)}`;
+  }
+
+  function normalizeTodoItems(
+    state: CustomAgentSessionState,
+    itemsRaw: unknown,
+  ): ReadonlyArray<CustomAgentTodoItem> {
+    if (!Array.isArray(itemsRaw)) throw new Error("todo_write requires an items array.");
+    const now = nowIso();
+    return itemsRaw.slice(0, MAX_TODO_ITEMS).flatMap((itemRaw) => {
+      if (!itemRaw || typeof itemRaw !== "object") return [];
+      const item = itemRaw as Record<string, unknown>;
+      const content =
+        typeof item.content === "string"
+          ? item.content.trim()
+          : typeof item.task === "string"
+            ? item.task.trim()
+            : "";
+      if (!content) return [];
+      const id = normalizeTodoId(item.id, content);
+      const previous = state.todos.get(id);
+      return [
+        {
+          id,
+          content: content.slice(0, MAX_TODO_TEXT_LENGTH),
+          status: normalizeTodoStatus(item.status),
+          createdAt: previous?.createdAt ?? now,
+          updatedAt: now,
+        },
+      ];
+    });
+  }
+
+  async function executeTodoRuntimeTool(inputTool: {
+    readonly state: CustomAgentSessionState;
+    readonly turnId: TurnId;
+    readonly tool: string;
+    readonly args: Record<string, unknown>;
+  }): Promise<CustomAgentToolResult> {
+    if (inputTool.tool === "todo_read") {
+      return {
+        ok: true,
+        content: JSON.stringify({
+          summary: todoSummaryLine(inputTool.state),
+          items: todoItemsForUi(inputTool.state),
+        }),
+      };
+    }
+
+    if (inputTool.tool !== "todo_write") {
+      return { ok: false, content: `Unknown todo tool: ${inputTool.tool}` };
+    }
+
+    const items = normalizeTodoItems(inputTool.state, inputTool.args.items);
+    if (items.length === 0) {
+      return { ok: false, content: "todo_write requires 1-12 non-empty items." };
+    }
+    inputTool.state.todos.clear();
+    for (const item of items) inputTool.state.todos.set(item.id, item);
+    await emitTodoList(
+      inputTool.state,
+      inputTool.turnId,
+      typeof inputTool.args.reason === "string" ? inputTool.args.reason.slice(0, 160) : "updated",
+    );
+    return {
+      ok: true,
+      content: JSON.stringify({
+        summary: todoSummaryLine(inputTool.state),
+        items: todoItemsForUi(inputTool.state),
+      }),
+    };
+  }
+
+  function compactSubagentText(content: string): string {
+    const normalized = content.replace(/\s+\n/g, "\n").trim();
+    return normalized.length > 6000 ? `${normalized.slice(0, 6000)}\n...[truncated]` : normalized;
+  }
+
+  function subagentStatus(task: CustomAgentSubagentTask): Record<string, unknown> {
+    return {
+      id: task.id,
+      name: task.name,
+      task: task.task.slice(0, 220),
+      wait: task.wait,
+      status: task.status,
+      createdAt: task.createdAt,
+      ...(task.completedAt ? { completedAt: task.completedAt } : {}),
+      ...(task.result ? { result: task.result.slice(0, 1800) } : {}),
+      ...(task.error ? { error: task.error } : {}),
+    };
+  }
+
+  function chooseSubagentName(
+    state: CustomAgentSessionState,
+    requestedName: string | undefined,
+  ): string {
+    const activeNames = new Set(
+      [...state.subagents.values()]
+        .filter((task) => task.status === "running")
+        .map((task) => task.name),
+    );
+    if (
+      requestedName &&
+      SUBAGENT_NAMES.includes(requestedName as (typeof SUBAGENT_NAMES)[number]) &&
+      !activeNames.has(requestedName)
+    )
+      return requestedName;
+    for (let index = 0; index < SUBAGENT_NAMES.length; index++) {
+      const name = SUBAGENT_NAMES[state.subagentNameCursor % SUBAGENT_NAMES.length] ?? "Aether";
+      state.subagentNameCursor += 1;
+      if (!activeNames.has(name)) return name;
+    }
+    const fallback = SUBAGENT_NAMES[state.subagentNameCursor % SUBAGENT_NAMES.length] ?? "Aether";
+    state.subagentNameCursor += 1;
+    return `${fallback}-${state.subagentNameCursor}`;
+  }
+
+  function parseSubagentSpecs(args: Record<string, unknown>): ReadonlyArray<{
+    readonly task: string;
+    readonly wait: boolean;
+    readonly name?: string | undefined;
+  }> {
+    const rawAgents = Array.isArray(args.agents) ? args.agents : undefined;
+    const records = rawAgents ?? (typeof args.task === "string" ? [{ task: args.task }] : []);
+    const specs: Array<{ task: string; wait: boolean; name?: string | undefined }> = [];
+    const seen = new Set<string>();
+    for (const raw of records.slice(0, MAX_SUBAGENTS_PER_CALL)) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const record = raw as Record<string, unknown>;
+      const task = typeof record.task === "string" ? record.task.trim() : "";
+      if (!task) continue;
+      const key = task.toLowerCase().replace(/\s+/g, " ");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const wait = typeof record.wait === "boolean" ? record.wait : true;
+      const name = typeof record.name === "string" ? record.name.trim() : undefined;
+      specs.push({ task, wait, ...(name ? { name } : {}) });
+    }
+    return specs;
+  }
+
+  function buildSubagentMessages(inputState: {
+    readonly state: CustomAgentSessionState;
+    readonly subagent: CustomAgentSubagentTask;
+    readonly userInput: string;
+    readonly workingContext: string;
+  }): CustomAgentChatMessage[] {
+    const recent = inputState.state.messages
+      .slice(-SUBAGENT_RECENT_MESSAGES)
+      .map((message) => `${message.role}: ${message.content.slice(0, 1200)}`)
+      .join("\n\n");
+    return [
+      {
+        role: "system",
+        content: [
+          `You are ${inputState.subagent.name}, a focused subagent inside KarsaCode.`,
+          "Work independently on only the assigned task.",
+          "Do not modify files. Do not ask for tools. Do not claim evidence you do not have.",
+          'Return exactly one JSON object: {"type":"final","content":"concise result with evidence, uncertainty, and useful next action"}.',
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          `Workspace: ${workspaceRootForSession(inputState.state)}`,
+          `Main user request:\n${inputState.userInput.slice(0, 3000)}`,
+          `Assigned subagent task:\n${inputState.subagent.task}`,
+          inputState.workingContext
+            ? `Working context:\n${inputState.workingContext.slice(0, 9000)}`
+            : "",
+          recent ? `Recent thread context:\n${recent}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+      },
+    ];
+  }
+
+  function extractSubagentFinalContent(raw: string): string {
+    const parsed = parseCustomAgentModelCommand(raw);
+    if (parsed.ok && parsed.command.type === "final") return parsed.command.content;
+    return raw;
+  }
+
+  async function runSubagentTask(inputState: {
+    readonly state: CustomAgentSessionState;
+    readonly subagent: CustomAgentSubagentTask;
+    readonly userInput: string;
+    readonly workingContext: string;
+  }): Promise<CustomAgentSubagentTask> {
+    const { state, subagent } = inputState;
+    try {
+      const output = await completeCustomAgentModel(input.backend, {
+        messages: buildSubagentMessages(inputState),
+        model: state.session.model ?? input.settings.model,
+        maxOutputTokens: Math.min(
+          input.settings.maxOutputTokens ?? SUBAGENT_MAX_OUTPUT_TOKENS,
+          SUBAGENT_MAX_OUTPUT_TOKENS,
+        ),
+        signal: subagent.abort.signal,
+      });
+      const result = compactSubagentText(extractSubagentFinalContent(output.content));
+      subagent.status = "completed";
+      subagent.result = result;
+      subagent.completedAt = nowIso();
+      state.messages.push({
+        role: "user",
+        content: `Subagent ${subagent.name} completed.\nTask: ${subagent.task}\nResult:\n${result}`,
+      });
+      await emit({
+        type: "item.completed",
+        ...eventBase({
+          instanceId: input.instanceId,
+          threadId: state.session.threadId,
+          turnId: subagent.turnId,
+          itemId: subagent.itemId,
+        }),
+        payload: {
+          itemType: "dynamic_tool_call",
+          status: "completed",
+          title: `Subagent ${subagent.name}`,
+          detail: subagent.wait ? "Completed waited subagent" : "Completed background subagent",
+          data: subagentStatus(subagent),
+        },
+      } as ProviderRuntimeEvent);
+    } catch (error) {
+      const aborted = subagent.abort.signal.aborted;
+      subagent.status = aborted ? "cancelled" : "failed";
+      subagent.error = aborted ? "Subagent cancelled." : formatCustomAgentRuntimeError(error);
+      subagent.completedAt = nowIso();
+      state.messages.push({
+        role: "user",
+        content: `Subagent ${subagent.name} ${subagent.status}.\nTask: ${subagent.task}\nError: ${subagent.error}`,
+      });
+      await emit({
+        type: "item.completed",
+        ...eventBase({
+          instanceId: input.instanceId,
+          threadId: state.session.threadId,
+          turnId: subagent.turnId,
+          itemId: subagent.itemId,
+        }),
+        payload: {
+          itemType: "dynamic_tool_call",
+          status: "failed",
+          title: `Subagent ${subagent.name}`,
+          detail: subagent.error,
+          data: subagentStatus(subagent),
+        },
+      } as ProviderRuntimeEvent);
+    }
+    return subagent;
+  }
+
+  async function spawnSubagent(inputState: {
+    readonly state: CustomAgentSessionState;
+    readonly turnId: TurnId;
+    readonly task: string;
+    readonly wait: boolean;
+    readonly userInput: string;
+    readonly workingContext: string;
+    readonly requestedName?: string | undefined;
+  }): Promise<CustomAgentSubagentTask> {
+    const id = `subagent_${randomUUID()}`;
+    const itemId = `item_${id}`;
+    const name = chooseSubagentName(inputState.state, inputState.requestedName);
+    const subagent: CustomAgentSubagentTask = {
+      id,
+      name,
+      task: inputState.task,
+      wait: inputState.wait,
+      turnId: inputState.turnId,
+      itemId,
+      createdAt: nowIso(),
+      abort: new AbortController(),
+      status: "running",
+    };
+    inputState.state.subagents.set(id, subagent);
+    await emit({
+      type: "item.started",
+      ...eventBase({
+        instanceId: input.instanceId,
+        threadId: inputState.state.session.threadId,
+        turnId: inputState.turnId,
+        itemId,
+      }),
+      payload: {
+        itemType: "dynamic_tool_call",
+        status: "inProgress",
+        title: `Subagent ${name}`,
+        detail: `${inputState.wait ? "wait" : "background"}: ${inputState.task.slice(0, 180)}`,
+        data: { id, name, wait: inputState.wait, task: inputState.task },
+      },
+    } as ProviderRuntimeEvent);
+    subagent.promise = runSubagentTask({
+      state: inputState.state,
+      subagent,
+      userInput: inputState.userInput,
+      workingContext: inputState.workingContext,
+    });
+    void subagent.promise;
+    return subagent;
+  }
+
+  async function waitForSubagents(
+    tasks: ReadonlyArray<CustomAgentSubagentTask>,
+    timeoutMs: number,
+  ): Promise<"completed" | "timeout"> {
+    const running = tasks.filter((task) => task.status === "running" && task.promise);
+    if (running.length === 0) return "completed";
+    const timeout = new Promise<"timeout">((resolve) =>
+      setTimeout(
+        () => resolve("timeout"),
+        Math.max(1000, Math.min(timeoutMs, SUBAGENT_WAIT_TIMEOUT_MS)),
+      ),
+    );
+    const all = Promise.all(running.map((task) => task.promise)).then(() => "completed" as const);
+    return await Promise.race([all, timeout]);
+  }
+
+  async function executeSubagentRuntimeTool(inputState: {
+    readonly state: CustomAgentSessionState;
+    readonly turnId: TurnId;
+    readonly tool: string;
+    readonly args: Record<string, unknown>;
+    readonly userInput: string;
+  }): Promise<CustomAgentToolResult> {
+    const { state, turnId, tool, args, userInput } = inputState;
+    if (tool === "subagent_status") {
+      const ids = Array.isArray(args.ids)
+        ? args.ids.filter((id): id is string => typeof id === "string")
+        : [];
+      const tasks = [...state.subagents.values()].filter((task) =>
+        ids.length > 0 ? ids.includes(task.id) : task.status === "running",
+      );
+      return {
+        ok: true,
+        content: JSON.stringify({ subagents: tasks.map(subagentStatus) }),
+        data: { subagents: tasks.map(subagentStatus) },
+      };
+    }
+
+    if (tool === "subagent_wait") {
+      const ids = Array.isArray(args.ids)
+        ? args.ids.filter((id): id is string => typeof id === "string")
+        : [];
+      const all = args.all === true;
+      const timeoutMs =
+        typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs)
+          ? args.timeoutMs
+          : SUBAGENT_WAIT_TIMEOUT_MS;
+      const tasks = [...state.subagents.values()].filter((task) =>
+        all || ids.length === 0 ? task.status === "running" : ids.includes(task.id),
+      );
+      const waitStatus = await waitForSubagents(tasks, timeoutMs);
+      return {
+        ok: true,
+        content: JSON.stringify({ waitStatus, subagents: tasks.map(subagentStatus) }),
+        data: { waitStatus, subagents: tasks.map(subagentStatus) },
+      };
+    }
+
+    if (tool !== "subagent_spawn") {
+      return { ok: false, content: `Unknown subagent tool: ${tool}` };
+    }
+
+    const runningCount = [...state.subagents.values()].filter(
+      (task) => task.status === "running",
+    ).length;
+    const availableSlots = Math.max(0, MAX_ACTIVE_SUBAGENTS_PER_SESSION - runningCount);
+    const specs = parseSubagentSpecs(args).slice(0, availableSlots);
+    const skipped = parseSubagentSpecs(args).length - specs.length;
+    const workingContext = contextStore.buildWorkingContext({
+      threadId: state.session.threadId,
+      currentUserRequest: state.messages.at(-1)?.content ?? "",
+      maxTokens: 3500,
+    });
+    const spawned = await Promise.all(
+      specs.map((spec) =>
+        spawnSubagent({
+          state,
+          turnId,
+          task: spec.task,
+          wait: spec.wait,
+          requestedName: spec.name,
+          userInput,
+          workingContext,
+        }),
+      ),
+    );
+    const waited = spawned.filter((task) => task.wait);
+    const waitStatus = await waitForSubagents(waited, SUBAGENT_WAIT_TIMEOUT_MS);
+    return {
+      ok: true,
+      content: JSON.stringify({
+        waitStatus,
+        spawned: spawned.map(subagentStatus),
+        waitedResults: waited.map(subagentStatus),
+        background: spawned.filter((task) => !task.wait).map(subagentStatus),
+        skippedDueToLimit: skipped,
+        note: "Background subagents keep running and their completion is injected into the main thread context automatically.",
+      }),
+      data: {
+        waitStatus,
+        spawned: spawned.map(subagentStatus),
+        waitedResults: waited.map(subagentStatus),
+        background: spawned.filter((task) => !task.wait).map(subagentStatus),
+        skippedDueToLimit: skipped,
+      },
+    };
+  }
+
+  function clearActiveTurn(state: CustomAgentSessionState, turnId: TurnId): void {
+    if (state.activeTurnId !== turnId) return;
+    state.activeTurnId = undefined;
+    state.activeAbort = undefined;
+    state.activeAssistantItemId = undefined;
+    state.activeToolCalls.clear();
+  }
+
+  async function settleTurnInterrupted(
+    state: CustomAgentSessionState,
+    turnId: TurnId,
+    reason: string,
+  ): Promise<void> {
+    if (isTurnSettled(state, turnId)) return;
+    state.settledTurnIds.add(turnId);
+    state.activeAbort?.abort();
+    for (const subagent of state.subagents.values()) {
+      if (subagent.turnId === turnId && subagent.wait && subagent.status === "running") {
+        subagent.abort.abort();
+      }
+    }
+    for (const pending of state.pendingApprovals.values()) pending.resolve("cancel");
+    state.pendingApprovals.clear();
+    state.pendingUserInputRequests.clear();
+
+    if (state.activeAssistantItemId) {
+      await emit({
+        type: "item.completed",
+        ...eventBase({
+          instanceId: input.instanceId,
+          threadId: state.session.threadId,
+          turnId,
+          itemId: state.activeAssistantItemId,
+        }),
+        payload: { itemType: "assistant_message", status: "failed", detail: reason },
+      } as ProviderRuntimeEvent);
+    }
+    for (const [toolCallId, toolCall] of state.activeToolCalls.entries()) {
+      const tool =
+        toolCall && typeof toolCall === "object" && "tool" in toolCall
+          ? String((toolCall as { tool?: unknown }).tool ?? "tool")
+          : "tool";
+      await emit({
+        type: "item.completed",
+        ...eventBase({
+          instanceId: input.instanceId,
+          threadId: state.session.threadId,
+          turnId,
+          itemId: toolCallId,
+        }),
+        payload: {
+          itemType: itemTypeForTool(tool),
+          status: "failed",
+          title: tool,
+          detail: reason,
+        },
+      } as ProviderRuntimeEvent);
+    }
+    await emit({
+      type: "turn.completed",
+      ...eventBase({ instanceId: input.instanceId, threadId: state.session.threadId, turnId }),
+      payload: { state: "interrupted", stopReason: reason },
+    } as ProviderRuntimeEvent);
+    state.session = {
+      ...state.session,
+      status: "ready",
+      activeTurnId: undefined,
+      lastError: undefined,
+      updatedAt: nowIso(),
+    };
+    clearActiveTurn(state, turnId);
+    await emit({
+      type: "session.state.changed",
+      ...eventBase({ instanceId: input.instanceId, threadId: state.session.threadId }),
+      payload: { state: "ready", reason },
+    } as ProviderRuntimeEvent);
+  }
+
+  async function settleTurnFailed(
+    state: CustomAgentSessionState,
+    turnId: TurnId,
+    message: string,
+  ): Promise<void> {
+    if (isTurnSettled(state, turnId)) return;
+    state.settledTurnIds.add(turnId);
+    await emitRuntimeError(state.session.threadId, turnId, message);
+    await emit({
+      type: "turn.completed",
+      ...eventBase({ instanceId: input.instanceId, threadId: state.session.threadId, turnId }),
+      payload: { state: "failed", errorMessage: message },
+    } as ProviderRuntimeEvent);
+    state.session = {
+      ...state.session,
+      status: "ready",
+      activeTurnId: undefined,
+      lastError: message,
+      updatedAt: nowIso(),
+    };
+    clearActiveTurn(state, turnId);
+    await emit({
+      type: "session.state.changed",
+      ...eventBase({ instanceId: input.instanceId, threadId: state.session.threadId }),
+      payload: { state: "ready", reason: "turn_failed" },
+    } as ProviderRuntimeEvent);
   }
 
   async function estimateModelInputTokens(
@@ -848,7 +1940,9 @@ export async function makeCustomAgentRuntime(input: {
     userInput: string,
     turnId: TurnId,
   ): Promise<void> {
+    const tools = toolsForWorkspace(workspaceRootForSession(state));
     const assistantItemId = `assistant_${randomUUID()}`;
+    state.activeAssistantItemId = assistantItemId;
     state.messages.push({ role: "user", content: userInput });
     state.tokenUsageEstimate = estimateMessages(state.messages);
     await emit({
@@ -868,12 +1962,14 @@ export async function makeCustomAgentRuntime(input: {
     } as ProviderRuntimeEvent);
     let invalidCalls = 0;
     let repoAutoInspected = false;
+    let todoFinalGuardUsed = false;
     const toolCallCounts = new Map<string, number>();
     const emitAutomaticTool = async (
       tool: string,
       args: Record<string, unknown>,
       reason: string,
     ): Promise<string | undefined> => {
+      assertTurnOpen(state, turnId);
       const toolCallId = `tool_${randomUUID()}`;
       await emit({
         type: "item.started",
@@ -897,10 +1993,12 @@ export async function makeCustomAgentRuntime(input: {
           toolCallId,
           runtimeMode: input.settings.defaultRuntimeMode,
           sandboxMode: input.settings.sandboxMode,
+          signal: state.activeAbort?.signal,
           requestApproval: async () => {
             throw new Error(`Automatic ${tool} requires approval; skipped.`);
           },
         });
+        assertTurnOpen(state, turnId);
         if (result.artifactId) state.toolArtifacts.push(result.artifactId);
         await emit({
           type: "item.completed",
@@ -924,6 +2022,7 @@ export async function makeCustomAgentRuntime(input: {
         });
         return result.content;
       } catch (error) {
+        if (state.activeAbort?.signal.aborted || isTurnSettled(state, turnId)) throw error;
         const message = formatCustomAgentRuntimeError(error);
         await emit({
           type: "item.completed",
@@ -948,7 +2047,238 @@ export async function makeCustomAgentRuntime(input: {
       }
     };
 
+    type StartedModelToolCall = {
+      readonly command: CustomAgentModelToolCall;
+      readonly toolCallId: string;
+      readonly itemType: ReturnType<typeof itemTypeForTool>;
+      readonly repeatCount: number;
+    };
+
+    const startModelToolCall = async (
+      command: CustomAgentModelToolCall,
+      index?: number,
+    ): Promise<StartedModelToolCall> => {
+      assertTurnOpen(state, turnId);
+      const toolCallId = `tool_${randomUUID()}`;
+      const toolCallSignature = `${command.tool}:${stableJson(command.args)}`;
+      const repeatCount = toolCallCounts.get(toolCallSignature) ?? 0;
+      toolCallCounts.set(toolCallSignature, repeatCount + 1);
+      state.activeToolCalls.set(toolCallId, command);
+      const itemType = itemTypeForTool(command.tool);
+      await emit({
+        type: "item.started",
+        ...eventBase({
+          instanceId: input.instanceId,
+          threadId: state.session.threadId,
+          turnId,
+          itemId: toolCallId,
+        }),
+        payload: {
+          itemType,
+          status: "inProgress",
+          title: command.tool,
+          detail:
+            index === undefined
+              ? command.reason
+              : command.reason
+                ? `parallel ${index + 1}: ${command.reason}`
+                : `parallel ${index + 1}`,
+          data: { args: command.args },
+        },
+      } as ProviderRuntimeEvent);
+      return { command, toolCallId, itemType, repeatCount };
+    };
+
+    const finishStartedModelToolCall = async (started: StartedModelToolCall): Promise<void> => {
+      const { command, toolCallId, itemType, repeatCount } = started;
+      if (repeatCount >= MAX_REPEAT_TOOL_CALLS) {
+        const skipped = {
+          ok: false,
+          content:
+            "Repeated identical tool call skipped. Use the previous tool result from context and answer final now, or call a different narrower tool only if required.",
+        };
+        await emit({
+          type: "item.completed",
+          ...eventBase({
+            instanceId: input.instanceId,
+            threadId: state.session.threadId,
+            turnId,
+            itemId: toolCallId,
+          }),
+          payload: {
+            itemType,
+            status: "failed",
+            title: command.tool,
+            detail: skipped.content,
+            data: { args: command.args },
+          },
+        } as ProviderRuntimeEvent);
+        state.messages.push(
+          {
+            role: "user",
+            content: formatToolResultForModel({
+              tool: command.tool,
+              ok: false,
+              content: skipped.content,
+            }),
+          },
+          {
+            role: "user",
+            content:
+              "Do not call the same tool with the same args again. Use existing evidence and answer final now unless a different tool is strictly necessary.",
+          },
+        );
+        state.activeToolCalls.delete(toolCallId);
+        return;
+      }
+      try {
+        const result = isSubagentTool(command.tool)
+          ? await executeSubagentRuntimeTool({
+              state,
+              turnId,
+              tool: command.tool,
+              args: command.args,
+              userInput,
+            })
+          : isTodoTool(command.tool)
+            ? await executeTodoRuntimeTool({
+                state,
+                turnId,
+                tool: command.tool,
+                args: command.args,
+              })
+            : await tools.execute(command.tool, command.args, {
+                threadId: state.session.threadId,
+                turnId,
+                toolCallId,
+                runtimeMode: input.settings.defaultRuntimeMode,
+                sandboxMode: input.settings.sandboxMode,
+                signal: state.activeAbort?.signal,
+                requestApproval: async (request) => {
+                  await emit({
+                    type: "request.opened",
+                    ...eventBase({
+                      instanceId: input.instanceId,
+                      threadId: state.session.threadId,
+                      turnId,
+                      requestId: request.requestId,
+                    }),
+                    payload: {
+                      requestType: request.requestType,
+                      detail: request.riskSummary,
+                      args: request,
+                    },
+                  } as ProviderRuntimeEvent);
+                  state.session = { ...state.session, status: "running", updatedAt: nowIso() };
+                  return await new Promise<ProviderApprovalDecision>((resolve) => {
+                    state.pendingApprovals.set(request.requestId, { request, resolve });
+                  }).then(async (decision) => {
+                    contextStore.recordDecision({
+                      requestId: request.requestId,
+                      decision,
+                      tool: request.toolName,
+                    });
+                    await emit({
+                      type: "request.resolved",
+                      ...eventBase({
+                        instanceId: input.instanceId,
+                        threadId: state.session.threadId,
+                        turnId,
+                        requestId: request.requestId,
+                      }),
+                      payload: { requestType: request.requestType, decision },
+                    } as ProviderRuntimeEvent);
+                    return decision;
+                  });
+                },
+                emitDiff: (diff) => {
+                  state.currentDiffs.push(diff);
+                  void emit({
+                    type: "turn.diff.updated",
+                    ...eventBase({
+                      instanceId: input.instanceId,
+                      threadId: state.session.threadId,
+                      turnId,
+                    }),
+                    payload: { unifiedDiff: diff },
+                  } as ProviderRuntimeEvent);
+                },
+              });
+        assertTurnOpen(state, turnId);
+        if (result.artifactId) state.toolArtifacts.push(result.artifactId);
+        state.turns
+          .find((turn) => turn.id === turnId)
+          ?.items.push({
+            toolCallId,
+            tool: command.tool,
+            result,
+          });
+        await emit({
+          type: "item.completed",
+          ...eventBase({
+            instanceId: input.instanceId,
+            threadId: state.session.threadId,
+            turnId,
+            itemId: toolCallId,
+          }),
+          payload: {
+            itemType,
+            status: result.ok ? "completed" : "failed",
+            title: command.tool,
+            detail: formatToolActivityDetail(command.tool, result),
+            data: result.data ?? { args: command.args },
+          },
+        } as ProviderRuntimeEvent);
+        state.messages.push({
+          role: "user",
+          content: formatToolResultForModel({
+            tool: command.tool,
+            ok: result.ok,
+            content: result.content,
+          }),
+        });
+      } catch (error) {
+        if (state.activeAbort?.signal.aborted || isTurnSettled(state, turnId)) throw error;
+        const message = formatCustomAgentRuntimeError(error);
+        await emit({
+          type: "item.completed",
+          ...eventBase({
+            instanceId: input.instanceId,
+            threadId: state.session.threadId,
+            turnId,
+            itemId: toolCallId,
+          }),
+          payload: {
+            itemType,
+            status: "failed",
+            title: command.tool,
+            detail: message,
+            data: { args: command.args },
+          },
+        } as ProviderRuntimeEvent);
+        state.messages.push({
+          role: "user",
+          content: formatToolResultForModel({
+            tool: command.tool,
+            ok: false,
+            content: message,
+          }),
+        });
+      } finally {
+        state.activeToolCalls.delete(toolCallId);
+      }
+    };
+
+    const executeModelToolCall = async (
+      command: CustomAgentModelToolCall,
+      index?: number,
+    ): Promise<void> => {
+      const started = await startModelToolCall(command, index);
+      await finishStartedModelToolCall(started);
+    };
+
     try {
+      assertTurnOpen(state, turnId);
       if (!state.projectContextInjected) {
         state.projectContextInjected = true;
         await emitAutomaticTool(
@@ -963,72 +2293,73 @@ export async function makeCustomAgentRuntime(input: {
         });
       }
       if (isProjectOverviewRequest(userInput)) {
+        assertTurnOpen(state, turnId);
         repoAutoInspected = true;
-        const listedContent = await emitAutomaticTool(
-          "tool_batch",
-          {
-            calls: [
-              {
-                tool: "find_files",
-                args: {
-                  query: "README",
-                  maxResults: 10,
-                  purpose: "Find project overview README candidates",
-                },
-              },
-              {
-                tool: "find_files",
-                args: {
-                  query: "package.json",
-                  maxResults: 10,
-                  purpose: "Find package manifest candidates",
-                },
-              },
-              {
-                tool: "find_files",
-                args: {
-                  query: "pnpm-workspace.yaml",
-                  maxResults: 5,
-                  purpose: "Find workspace manifest candidates",
-                },
-              },
-              {
-                tool: "find_files",
-                args: {
-                  query: "turbo.json",
-                  maxResults: 5,
-                  purpose: "Find build orchestration config candidates",
-                },
-              },
-              {
-                tool: "find_files",
-                args: {
-                  query: "AGENTS.md",
-                  maxResults: 5,
-                  purpose: "Find local agent instructions",
-                },
-              },
-            ],
-            purpose: "Auto-find compact project overview files",
-          },
-          "Auto-find project overview files",
+        const listedContents = await Promise.all([
+          emitAutomaticTool(
+            "find_files",
+            {
+              query: "README",
+              maxResults: 10,
+              purpose: "Find project overview README candidates",
+            },
+            "Auto-find README files",
+          ),
+          emitAutomaticTool(
+            "find_files",
+            {
+              query: "package.json",
+              maxResults: 10,
+              purpose: "Find package manifest candidates",
+            },
+            "Auto-find package manifests",
+          ),
+          emitAutomaticTool(
+            "find_files",
+            {
+              query: "pnpm-workspace.yaml",
+              maxResults: 5,
+              purpose: "Find workspace manifest candidates",
+            },
+            "Auto-find workspace manifests",
+          ),
+          emitAutomaticTool(
+            "find_files",
+            {
+              query: "turbo.json",
+              maxResults: 5,
+              purpose: "Find build orchestration config candidates",
+            },
+            "Auto-find build orchestration config",
+          ),
+          emitAutomaticTool(
+            "find_files",
+            {
+              query: "AGENTS.md",
+              maxResults: 5,
+              purpose: "Find local agent instructions",
+            },
+            "Auto-find local agent instructions",
+          ),
+        ]);
+        const overviewFiles = selectProjectOverviewFiles(
+          listedContents.flatMap((content) => (content ? extractListedFiles(content) : [])),
         );
-        const overviewFiles = listedContent
-          ? selectProjectOverviewFiles(extractListedFiles(listedContent))
-          : [];
-        if (input.settings.approvalPolicy !== "always") {
-          for (const path of overviewFiles) {
-            await emitAutomaticTool(
-              "read_file",
-              {
-                path,
-                startLine: 1,
-                endLine: path.toLowerCase() === "package.json" ? 120 : 80,
-                purpose: "Auto-read project overview evidence",
-              },
-              `Auto-read ${path}`,
-            );
-          }
+        if (input.settings.approvalPolicy !== "always" && overviewFiles.length > 0) {
+          await Promise.all(
+            overviewFiles.map((path) =>
+              emitAutomaticTool(
+                "read_file",
+                {
+                  path,
+                  startLine: 1,
+                  endLine: path.toLowerCase() === "package.json" ? 120 : 80,
+                  purpose: "Auto-read project overview evidence",
+                },
+                `Auto-read ${path}`,
+              ),
+            ),
+          );
         }
         state.messages.push({
           role: "user",
@@ -1037,7 +2368,7 @@ export async function makeCustomAgentRuntime(input: {
         });
       }
       for (let step = 0; step < MAX_TOOL_STEPS; step++) {
-        if (state.activeAbort?.signal.aborted) throw new Error("Turn interrupted.");
+        assertTurnOpen(state, turnId);
         const model = state.session.model ?? input.settings.model;
         const budget = await contextBudget(input.settings, input.backend, model);
         let workingContext = contextStore.buildWorkingContext({
@@ -1051,6 +2382,7 @@ export async function makeCustomAgentRuntime(input: {
           currentUserRequest: userInput,
           workingContext,
         });
+        assertTurnOpen(state, turnId);
         if (compacted) {
           workingContext = contextStore.buildWorkingContext({
             threadId: state.session.threadId,
@@ -1058,6 +2390,7 @@ export async function makeCustomAgentRuntime(input: {
             maxTokens: Math.floor(budget * 0.45),
           });
         }
+        const todoRuntimeHint = buildTodoRuntimeHint(state, userInput);
         const llmMessages: CustomAgentChatMessage[] = [
           {
             role: "system",
@@ -1065,6 +2398,14 @@ export async function makeCustomAgentRuntime(input: {
           },
           ...state.messages.slice(-20),
           { role: "system", content: `Compact working context:\n${workingContext}` },
+          ...(todoRuntimeHint
+            ? [
+                {
+                  role: "system" as const,
+                  content: todoRuntimeHint,
+                },
+              ]
+            : []),
         ];
         await emitContextUsageSnapshot({
           state,
@@ -1075,28 +2416,35 @@ export async function makeCustomAgentRuntime(input: {
           ),
           model: state.session.model ?? input.settings.model,
         });
-        let liveFinalContent = "";
-        const output = await completeCustomAgentModel(
-          input.backend,
-          {
+        let output: Awaited<ReturnType<typeof completeCustomAgentModel>>;
+        let streamedFinalContent = "";
+        try {
+          output = await completeModelWithRetry({
+            state,
+            turnId,
             messages: llmMessages,
             model: state.session.model ?? input.settings.model,
             maxOutputTokens: input.settings.maxOutputTokens,
-          },
-          async (delta) => {
-            liveFinalContent += delta;
-            await emit({
-              type: "content.delta",
-              ...eventBase({
-                instanceId: input.instanceId,
-                threadId: state.session.threadId,
-                turnId,
-                itemId: assistantItemId,
-              }),
-              payload: { streamKind: "assistant_text", delta },
-            } as ProviderRuntimeEvent);
-          },
-        );
+            onFinalContentDelta: async (delta) => {
+              assertTurnOpen(state, turnId);
+              streamedFinalContent += delta;
+              await emit({
+                type: "content.delta",
+                ...eventBase({
+                  instanceId: input.instanceId,
+                  threadId: state.session.threadId,
+                  turnId,
+                  itemId: assistantItemId,
+                }),
+                payload: { streamKind: "assistant_text", delta },
+              } as ProviderRuntimeEvent);
+            },
+          });
+          assertTurnOpen(state, turnId);
+        } catch (error) {
+          throw error;
+        }
+        assertTurnOpen(state, turnId);
         const parsed = parseCustomAgentModelCommand(output.content.trim());
         if (!parsed.ok) {
           invalidCalls += 1;
@@ -1108,9 +2456,27 @@ export async function makeCustomAgentRuntime(input: {
           continue;
         }
         if (parsed.command.type === "final") {
+          const openTodos = openTodoItems(state);
+          if (
+            shouldRequireTodoForUserInput(userInput) &&
+            openTodos.length > 0 &&
+            !todoFinalGuardUsed &&
+            invalidCalls < MAX_INVALID_TOOL_CALLS
+          ) {
+            todoFinalGuardUsed = true;
+            invalidCalls += 1;
+            state.messages.push({
+              role: "user",
+              content: [
+                "Before final, reconcile the visible todo checklist with the work actually completed.",
+                `Open todo items: ${openTodos.map((item) => `${item.status}:${item.content}`).join(" | ")}`,
+                "If work is done, call todo_write marking completed items. If not done, mark blocked/pending truthfully, then answer final.",
+              ].join("\n"),
+            });
+            continue;
+          }
           if (
             repoAutoInspected &&
-            liveFinalContent.length === 0 &&
             isPassiveUnverifiedProjectAnswer(parsed.command.content) &&
             invalidCalls < MAX_INVALID_TOOL_CALLS
           ) {
@@ -1122,8 +2488,24 @@ export async function makeCustomAgentRuntime(input: {
             });
             continue;
           }
-          const remainingContent = parsed.command.content.slice(liveFinalContent.length);
-          if (remainingContent.length > 0)
+          if (
+            isProjectOverviewRequest(userInput) &&
+            isLikelyRawStructuredFileDump(parsed.command.content) &&
+            invalidCalls < MAX_INVALID_TOOL_CALLS
+          ) {
+            invalidCalls += 1;
+            state.messages.push({
+              role: "user",
+              content:
+                "Your previous final answer pasted raw file or tool output. Summarize the inspected project evidence instead. Do not paste raw package.json or raw file contents unless the user explicitly asks for raw content.",
+            });
+            continue;
+          }
+          const remainingContent = parsed.command.content.startsWith(streamedFinalContent)
+            ? parsed.command.content.slice(streamedFinalContent.length)
+            : parsed.command.content;
+          for (const delta of chunkAssistantText(remainingContent)) {
+            assertTurnOpen(state, turnId);
             await emit({
               type: "content.delta",
               ...eventBase({
@@ -1132,8 +2514,10 @@ export async function makeCustomAgentRuntime(input: {
                 turnId,
                 itemId: assistantItemId,
               }),
-              payload: { streamKind: "assistant_text", delta: remainingContent },
+              payload: { streamKind: "assistant_text", delta },
             } as ProviderRuntimeEvent);
+          }
+          assertTurnOpen(state, turnId);
           state.messages.push({ role: "assistant", content: parsed.command.content });
           const actualPromptTokens = extractPromptTokensFromUsage(output.usage);
           const usedTokens = actualPromptTokens ?? estimateMessages(state.messages);
@@ -1169,211 +2553,73 @@ export async function makeCustomAgentRuntime(input: {
               },
             },
           } as ProviderRuntimeEvent);
+          state.settledTurnIds.add(turnId);
           state.session = {
             ...state.session,
             status: "ready",
             activeTurnId: undefined,
+            lastError: undefined,
             updatedAt: nowIso(),
           };
-          state.activeTurnId = undefined;
+          clearActiveTurn(state, turnId);
+          await emit({
+            type: "session.state.changed",
+            ...eventBase({ instanceId: input.instanceId, threadId: state.session.threadId }),
+            payload: { state: "ready", reason: "turn_completed" },
+          } as ProviderRuntimeEvent);
           return;
         }
-        const toolCallId = `tool_${randomUUID()}`;
-        const toolCallSignature = `${parsed.command.tool}:${stableJson(parsed.command.args)}`;
-        const repeatCount = toolCallCounts.get(toolCallSignature) ?? 0;
-        toolCallCounts.set(toolCallSignature, repeatCount + 1);
-        state.activeToolCalls.set(toolCallId, parsed.command);
-        const itemType =
-          parsed.command.tool === "run_command"
-            ? "command_execution"
-            : parsed.command.tool.includes("mcp")
-              ? "mcp_tool_call"
-              : ["write_file", "edit_file", "apply_patch"].includes(parsed.command.tool)
-                ? "file_change"
-                : "dynamic_tool_call";
-        await emit({
-          type: "item.started",
-          ...eventBase({
-            instanceId: input.instanceId,
-            threadId: state.session.threadId,
-            turnId,
-            itemId: toolCallId,
-          }),
-          payload: {
-            itemType,
-            status: "inProgress",
-            title: parsed.command.tool,
-            detail: parsed.command.reason,
-          },
-        } as ProviderRuntimeEvent);
-        if (repeatCount >= MAX_REPEAT_TOOL_CALLS) {
-          const skipped = {
-            ok: false,
-            content:
-              "Repeated identical tool call skipped. Use the previous tool result from context and answer final now, or call a different narrower tool only if required.",
-          };
-          await emit({
-            type: "item.completed",
-            ...eventBase({
-              instanceId: input.instanceId,
-              threadId: state.session.threadId,
-              turnId,
-              itemId: toolCallId,
-            }),
-            payload: {
-              itemType,
-              status: "failed",
-              title: parsed.command.tool,
-              detail: skipped.content,
-            },
-          } as ProviderRuntimeEvent);
-          state.messages.push(
-            {
+        const toolCalls: ReadonlyArray<CustomAgentModelToolCall> =
+          parsed.command.type === "tool_calls"
+            ? parsed.command.calls
+            : [
+                {
+                  tool: parsed.command.tool,
+                  args: parsed.command.args,
+                  reason: parsed.command.reason,
+                },
+              ];
+        if (canRunToolCallsConcurrently(toolCalls)) {
+          const startedToolCalls: StartedModelToolCall[] = [];
+          for (const [index, command] of toolCalls.entries()) {
+            startedToolCalls.push(await startModelToolCall(command, index));
+          }
+          const settledToolCalls = await Promise.allSettled(
+            startedToolCalls.map((started) => finishStartedModelToolCall(started)),
+          );
+          const fatalToolError = settledToolCalls.find(
+            (result) => result.status === "rejected" && isAbortLikeError(result.reason),
+          );
+          if (fatalToolError?.status === "rejected") throw fatalToolError.reason;
+          const unexpectedToolErrors = settledToolCalls.filter(
+            (result): result is PromiseRejectedResult => result.status === "rejected",
+          );
+          for (const failed of unexpectedToolErrors) {
+            const message = formatCustomAgentRuntimeError(failed.reason);
+            state.messages.push({
               role: "user",
               content: formatToolResultForModel({
-                tool: parsed.command.tool,
+                tool: "parallel_tool_call",
                 ok: false,
-                content: skipped.content,
+                content: message,
               }),
-            },
-            {
-              role: "user",
-              content:
-                "Do not call the same tool with the same args again. Use existing evidence and answer final now unless a different tool is strictly necessary.",
-            },
-          );
-          state.activeToolCalls.delete(toolCallId);
-          continue;
-        }
-        try {
-          const result = await tools.execute(parsed.command.tool, parsed.command.args, {
-            threadId: state.session.threadId,
-            turnId,
-            toolCallId,
-            runtimeMode: input.settings.defaultRuntimeMode,
-            sandboxMode: input.settings.sandboxMode,
-            requestApproval: async (request) => {
-              await emit({
-                type: "request.opened",
-                ...eventBase({
-                  instanceId: input.instanceId,
-                  threadId: state.session.threadId,
-                  turnId,
-                  requestId: request.requestId,
-                }),
-                payload: {
-                  requestType: request.requestType,
-                  detail: request.riskSummary,
-                  args: request,
-                },
-              } as ProviderRuntimeEvent);
-              state.session = { ...state.session, status: "running", updatedAt: nowIso() };
-              return await new Promise<ProviderApprovalDecision>((resolve) => {
-                state.pendingApprovals.set(request.requestId, { request, resolve });
-              }).then(async (decision) => {
-                contextStore.recordDecision({
-                  requestId: request.requestId,
-                  decision,
-                  tool: request.toolName,
-                });
-                await emit({
-                  type: "request.resolved",
-                  ...eventBase({
-                    instanceId: input.instanceId,
-                    threadId: state.session.threadId,
-                    turnId,
-                    requestId: request.requestId,
-                  }),
-                  payload: { requestType: request.requestType, decision },
-                } as ProviderRuntimeEvent);
-                return decision;
-              });
-            },
-            emitDiff: (diff) => {
-              state.currentDiffs.push(diff);
-              void emit({
-                type: "turn.diff.updated",
-                ...eventBase({
-                  instanceId: input.instanceId,
-                  threadId: state.session.threadId,
-                  turnId,
-                }),
-                payload: { unifiedDiff: diff },
-              } as ProviderRuntimeEvent);
-            },
-          });
-          if (result.artifactId) state.toolArtifacts.push(result.artifactId);
-          state.turns
-            .find((turn) => turn.id === turnId)
-            ?.items.push({ toolCallId, tool: parsed.command.tool, result });
-          await emit({
-            type: "item.completed",
-            ...eventBase({
-              instanceId: input.instanceId,
-              threadId: state.session.threadId,
-              turnId,
-              itemId: toolCallId,
-            }),
-            payload: {
-              itemType,
-              status: result.ok ? "completed" : "failed",
-              title: parsed.command.tool,
-              detail: formatToolActivityDetail(parsed.command.tool, result),
-              data: result.data,
-            },
-          } as ProviderRuntimeEvent);
-          state.messages.push({
-            role: "user",
-            content: formatToolResultForModel({
-              tool: parsed.command.tool,
-              ok: result.ok,
-              content: result.content,
-            }),
-          });
-        } catch (error) {
-          const message = formatCustomAgentRuntimeError(error);
-          await emit({
-            type: "item.completed",
-            ...eventBase({
-              instanceId: input.instanceId,
-              threadId: state.session.threadId,
-              turnId,
-              itemId: toolCallId,
-            }),
-            payload: { itemType, status: "failed", title: parsed.command.tool, detail: message },
-          } as ProviderRuntimeEvent);
-          state.messages.push({
-            role: "user",
-            content: formatToolResultForModel({
-              tool: parsed.command.tool,
-              ok: false,
-              content: message,
-            }),
-          });
-        } finally {
-          state.activeToolCalls.delete(toolCallId);
+            });
+          }
+        } else {
+          for (const [index, command] of toolCalls.entries()) {
+            await executeModelToolCall(command, toolCalls.length > 1 ? index : undefined);
+          }
         }
       }
       throw new Error("Tool step limit exceeded.");
     } catch (error) {
+      if (isTurnSettled(state, turnId)) return;
       const message = formatCustomAgentRuntimeError(error);
-      await emitRuntimeError(state.session.threadId, turnId, message);
-      await emit({
-        type: "turn.completed",
-        ...eventBase({ instanceId: input.instanceId, threadId: state.session.threadId, turnId }),
-        payload: {
-          state: state.activeAbort?.signal.aborted ? "interrupted" : "failed",
-          errorMessage: message,
-        },
-      } as ProviderRuntimeEvent);
-      state.session = {
-        ...state.session,
-        status: "error",
-        activeTurnId: undefined,
-        lastError: message,
-        updatedAt: nowIso(),
-      };
-      state.activeTurnId = undefined;
+      if (state.activeAbort?.signal.aborted || message.includes("Turn interrupted.")) {
+        await settleTurnInterrupted(state, turnId, "Interrupted");
+        return;
+      }
+      await settleTurnFailed(state, turnId, message);
     }
   }
 
@@ -1381,7 +2627,7 @@ export async function makeCustomAgentRuntime(input: {
     settings: input.settings,
     workspaceRoot: input.workspaceRoot,
     contextStore,
-    tools,
+    tools: defaultTools,
     events,
     startSession: async (sessionInput) => {
       const session: ProviderSession = {
@@ -1389,7 +2635,7 @@ export async function makeCustomAgentRuntime(input: {
         providerInstanceId: input.instanceId,
         status: "ready",
         runtimeMode: sessionInput.runtimeMode,
-        cwd: sessionInput.cwd ?? input.workspaceRoot,
+        cwd: path.resolve(sessionInput.cwd ?? input.workspaceRoot),
         model: sessionInput.modelSelection?.model ?? input.settings.model,
         threadId: sessionInput.threadId,
         resumeCursor: sessionInput.resumeCursor,
@@ -1403,6 +2649,9 @@ export async function makeCustomAgentRuntime(input: {
         pendingApprovals: new Map(),
         pendingUserInputRequests: new Map(),
         activeToolCalls: new Map(),
+        subagents: new Map(),
+        todos: new Map(),
+        settledTurnIds: new Set(),
         toolArtifacts: [],
         contextReferences: [],
         currentDiffs: [],
@@ -1414,6 +2663,7 @@ export async function makeCustomAgentRuntime(input: {
         tokenUsageEstimate: 0,
         lastCompactionMessageCount: 0,
         projectContextInjected: false,
+        subagentNameCursor: 0,
         turns: [],
       };
       sessions.set(session.threadId, state);
@@ -1440,6 +2690,8 @@ export async function makeCustomAgentRuntime(input: {
       const turnId = TurnId.make(`turn_${randomUUID()}`);
       state.activeTurnId = turnId;
       state.activeAbort = new AbortController();
+      state.activeAssistantItemId = undefined;
+      state.settledTurnIds.delete(turnId);
       state.turns.push({ id: turnId, items: [] });
       state.session = {
         ...state.session,
@@ -1448,12 +2700,18 @@ export async function makeCustomAgentRuntime(input: {
         model: turnInput.modelSelection?.model ?? state.session.model,
         updatedAt: nowIso(),
       };
-      void runTurn(state, turnInput.input ?? "", turnId);
+      void runTurn(state, turnInput.input ?? "", turnId).catch((error: unknown) =>
+        settleTurnFailed(state, turnId, formatCustomAgentRuntimeError(error)),
+      );
       return { threadId: turnInput.threadId, turnId } satisfies ProviderTurnStartResult;
     },
     interruptTurn: async (threadId, turnId) => {
       const state = getSession(threadId);
-      if (!turnId || state.activeTurnId === turnId) state.activeAbort?.abort();
+      const activeTurnId = state.activeTurnId;
+      if (!activeTurnId) return;
+      if (!turnId || activeTurnId === turnId) {
+        await settleTurnInterrupted(state, activeTurnId, "Interrupted by user");
+      }
     },
     respondToRequest: async (threadId, requestId, decision) => {
       const state = getSession(threadId);
@@ -1469,7 +2727,12 @@ export async function makeCustomAgentRuntime(input: {
     },
     stopSession: async (threadId) => {
       const state = getSession(threadId);
-      state.activeAbort?.abort();
+      for (const subagent of state.subagents.values()) {
+        if (subagent.status === "running") subagent.abort.abort();
+      }
+      if (state.activeTurnId) {
+        await settleTurnInterrupted(state, state.activeTurnId, "Session stopped");
+      }
       state.session = { ...state.session, status: "closed", updatedAt: nowIso() };
       sessions.delete(threadId);
       await emit({
@@ -1487,8 +2750,17 @@ export async function makeCustomAgentRuntime(input: {
       return { threadId, turns: state.turns };
     },
     stopAll: async () => {
+      for (const state of sessions.values()) {
+        for (const subagent of state.subagents.values()) {
+          if (subagent.status === "running") subagent.abort.abort();
+        }
+      }
       await Promise.all(
-        [...sessions.keys()].map((threadId) => getSession(threadId).activeAbort?.abort()),
+        [...sessions.values()].map((state) =>
+          state.activeTurnId
+            ? settleTurnInterrupted(state, state.activeTurnId, "All sessions stopped")
+            : Promise.resolve(),
+        ),
       );
       sessions.clear();
     },

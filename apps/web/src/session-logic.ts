@@ -60,11 +60,50 @@ export interface WorkLogEntry {
   detail?: string;
   command?: string;
   rawCommand?: string;
+  output?: string;
+  outputLabel?: string;
+  outputTruncated?: boolean;
+  batchResults?: ReadonlyArray<{
+    tool: string;
+    ok: boolean;
+    summary: string;
+    artifactId?: string;
+  }>;
+  webSources?: ReadonlyArray<WorkLogWebSource>;
   changedFiles?: ReadonlyArray<string>;
   tone: "thinking" | "tool" | "info" | "error";
+  status?: "inProgress" | "completed" | "failed";
   toolTitle?: string;
   itemType?: ToolLifecycleItemType;
   requestKind?: PendingApproval["requestKind"];
+  todoList?: WorkLogTodoList;
+  visibleInTimeline?: boolean;
+}
+
+export interface WorkLogTodoList {
+  reason?: string;
+  counts: {
+    pending: number;
+    inProgress: number;
+    completed: number;
+    blocked: number;
+  };
+  items: ReadonlyArray<{
+    id: string;
+    content: string;
+    status: "pending" | "inProgress" | "completed" | "blocked";
+    updatedAt?: string;
+  }>;
+}
+
+export interface WorkLogWebSource {
+  title?: string;
+  url: string;
+  publishedDate?: string;
+  author?: string;
+  text?: string;
+  status?: "ok" | "failed";
+  error?: string;
 }
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
@@ -493,7 +532,6 @@ export function deriveWorkLogEntries(
   const ordered = [...activities].toSorted(compareActivitiesByOrder);
   const entries = ordered
     .filter((activity) => (latestTurnId ? activity.turnId === latestTurnId : true))
-    .filter((activity) => activity.kind !== "tool.started")
     .filter((activity) => activity.kind !== "task.started")
     .filter((activity) => activity.kind !== "context-window.updated")
     .filter((activity) => activity.summary !== "Checkpoint captured")
@@ -523,6 +561,10 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       : null;
   const commandPreview = extractToolCommand(payload);
   const changedFiles = extractChangedFiles(payload);
+  const toolOutput = extractToolOutput(payload);
+  const batchResults = extractBatchResults(payload);
+  const webSources = extractWebSources(payload);
+  const todoList = extractTodoList(payload);
   const title = extractToolTitle(payload);
   const isTaskActivity = activity.kind === "task.progress" || activity.kind === "task.completed";
   const taskSummary =
@@ -560,6 +602,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   };
   const itemType = extractWorkLogItemType(payload);
   const requestKind = extractWorkLogRequestKind(payload);
+  const status = extractWorkLogStatus(payload, activity.kind);
   if (detail) {
     entry.detail = detail;
   }
@@ -568,6 +611,21 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   }
   if (commandPreview.rawCommand) {
     entry.rawCommand = commandPreview.rawCommand;
+  }
+  if (toolOutput.output) {
+    entry.output = toolOutput.output;
+  }
+  if (toolOutput.outputLabel) {
+    entry.outputLabel = toolOutput.outputLabel;
+  }
+  if (toolOutput.outputTruncated) {
+    entry.outputTruncated = true;
+  }
+  if (batchResults.length > 0) {
+    entry.batchResults = batchResults;
+  }
+  if (webSources.length > 0) {
+    entry.webSources = webSources;
   }
   if (changedFiles.length > 0) {
     entry.changedFiles = changedFiles;
@@ -581,12 +639,29 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (requestKind) {
     entry.requestKind = requestKind;
   }
+  if (todoList) {
+    entry.todoList = todoList;
+    entry.visibleInTimeline = false;
+    entry.collapseKey = "task:todo_list";
+    entry.status =
+      todoList.counts.blocked > 0
+        ? "failed"
+        : todoList.counts.completed === todoList.items.length
+          ? "completed"
+          : "inProgress";
+  }
+  if (status && !todoList) {
+    entry.status = status;
+  }
   if (toolCallId) {
     entry.toolCallId = toolCallId;
   }
   const collapseKey = deriveToolLifecycleCollapseKey(entry);
   if (collapseKey) {
     entry.collapseKey = collapseKey;
+  }
+  if (isTaskActivity && batchResults.length === 0 && !todoList) {
+    entry.visibleInTimeline = false;
   }
   return entry;
 }
@@ -610,10 +685,18 @@ function shouldCollapseToolLifecycleEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): boolean {
-  if (previous.activityKind !== "tool.updated" && previous.activityKind !== "tool.completed") {
+  if (
+    previous.todoList &&
+    next.todoList &&
+    previous.collapseKey !== undefined &&
+    previous.collapseKey === next.collapseKey
+  ) {
+    return true;
+  }
+  if (!isToolLifecycleActivityKind(previous.activityKind)) {
     return false;
   }
-  if (next.activityKind !== "tool.updated" && next.activityKind !== "tool.completed") {
+  if (!isToolLifecycleActivityKind(next.activityKind)) {
     return false;
   }
   if (previous.activityKind === "tool.completed") {
@@ -636,12 +719,15 @@ function mergeDerivedWorkLogEntries(
   next: DerivedWorkLogEntry,
 ): DerivedWorkLogEntry {
   const changedFiles = mergeChangedFiles(previous.changedFiles, next.changedFiles);
+  const webSources = mergeWebSources(previous.webSources, next.webSources);
   const detail = next.detail ?? previous.detail;
   const command = next.command ?? previous.command;
   const rawCommand = next.rawCommand ?? previous.rawCommand;
   const toolTitle = next.toolTitle ?? previous.toolTitle;
   const itemType = next.itemType ?? previous.itemType;
   const requestKind = next.requestKind ?? previous.requestKind;
+  const todoList = next.todoList ?? previous.todoList;
+  const status = next.status ?? previous.status;
   const collapseKey = next.collapseKey ?? previous.collapseKey;
   const toolCallId = next.toolCallId ?? previous.toolCallId;
   return {
@@ -651,9 +737,12 @@ function mergeDerivedWorkLogEntries(
     ...(command ? { command } : {}),
     ...(rawCommand ? { rawCommand } : {}),
     ...(changedFiles.length > 0 ? { changedFiles } : {}),
+    ...(webSources.length > 0 ? { webSources } : {}),
     ...(toolTitle ? { toolTitle } : {}),
     ...(itemType ? { itemType } : {}),
     ...(requestKind ? { requestKind } : {}),
+    ...(todoList ? { todoList } : {}),
+    ...(status ? { status } : {}),
     ...(collapseKey ? { collapseKey } : {}),
     ...(toolCallId ? { toolCallId } : {}),
   };
@@ -670,8 +759,21 @@ function mergeChangedFiles(
   return [...new Set(merged)];
 }
 
+function mergeWebSources(
+  previous: ReadonlyArray<WorkLogWebSource> | undefined,
+  next: ReadonlyArray<WorkLogWebSource> | undefined,
+): WorkLogWebSource[] {
+  const merged = [...(previous ?? []), ...(next ?? [])];
+  if (merged.length === 0) return [];
+  const byKey = new Map<string, WorkLogWebSource>();
+  for (const source of merged) {
+    byKey.set(source.url || source.error || JSON.stringify(source), source);
+  }
+  return [...byKey.values()];
+}
+
 function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | undefined {
-  if (entry.activityKind !== "tool.updated" && entry.activityKind !== "tool.completed") {
+  if (!isToolLifecycleActivityKind(entry.activityKind)) {
     return undefined;
   }
   if (entry.toolCallId) {
@@ -684,6 +786,12 @@ function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | un
     return undefined;
   }
   return [itemType, normalizedLabel, detail].join("\u001f");
+}
+
+function isToolLifecycleActivityKind(
+  kind: OrchestrationThreadActivity["kind"],
+): kind is "tool.started" | "tool.updated" | "tool.completed" {
+  return kind === "tool.started" || kind === "tool.updated" || kind === "tool.completed";
 }
 
 function normalizeCompactToolLabel(value: string): string {
@@ -704,6 +812,18 @@ function toLatestProposedPlanState(proposedPlan: ProposedPlan): LatestProposedPl
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function parseJsonRecord(value: string | null | undefined): Record<string, unknown> | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return asRecord(parsed);
+  } catch {
+    return null;
+  }
 }
 
 function asTrimmedString(value: unknown): string | null {
@@ -903,7 +1023,35 @@ function extractToolTitle(payload: Record<string, unknown> | null): string | nul
 
 function extractToolCallId(payload: Record<string, unknown> | null): string | null {
   const data = asRecord(payload?.data);
-  return asTrimmedString(data?.toolCallId);
+  return asTrimmedString(payload?.toolCallId) ?? asTrimmedString(data?.toolCallId);
+}
+
+function extractWorkLogStatus(
+  payload: Record<string, unknown> | null,
+  kind: OrchestrationThreadActivity["kind"],
+): WorkLogEntry["status"] | undefined {
+  const rawStatus = asTrimmedString(payload?.status)?.toLowerCase();
+  if (rawStatus === "failed" || rawStatus === "error") {
+    return "failed";
+  }
+  if (rawStatus === "completed" || rawStatus === "complete" || rawStatus === "success") {
+    return "completed";
+  }
+  if (
+    rawStatus === "inprogress" ||
+    rawStatus === "in_progress" ||
+    rawStatus === "running" ||
+    rawStatus === "started"
+  ) {
+    return "inProgress";
+  }
+  if (kind === "tool.started" || kind === "tool.updated") {
+    return "inProgress";
+  }
+  if (kind === "tool.completed") {
+    return "completed";
+  }
+  return undefined;
 }
 
 function normalizeInlinePreview(value: string): string {
@@ -940,7 +1088,176 @@ function summarizeToolTextOutput(value: string): string | null {
   return null;
 }
 
+function summarizeBatchResultContent(content: string | null): string | null {
+  const parsed = parseJsonRecord(content);
+  if (!parsed) {
+    return content ? summarizeToolTextOutput(content) : null;
+  }
+
+  const summary = asTrimmedString(parsed.summary);
+  if (summary) {
+    return summary;
+  }
+
+  const totalFiles = asNumber(parsed.totalFiles);
+  if (totalFiles !== null) {
+    return `${totalFiles.toLocaleString()} file${totalFiles === 1 ? "" : "s"}`;
+  }
+
+  const totalMatches = asNumber(parsed.totalMatches);
+  if (totalMatches !== null) {
+    return `${totalMatches.toLocaleString()} match${totalMatches === 1 ? "" : "es"}`;
+  }
+
+  const files = Array.isArray(parsed.files) ? parsed.files.length : null;
+  if (files !== null) {
+    return `${files.toLocaleString()} file${files === 1 ? "" : "s"}`;
+  }
+
+  const snippets = Array.isArray(parsed.snippets) ? parsed.snippets.length : null;
+  if (snippets !== null) {
+    return `${snippets.toLocaleString()} match${snippets === 1 ? "" : "es"}`;
+  }
+
+  return content ? summarizeToolTextOutput(content) : null;
+}
+
+function extractBatchResultSource(
+  payload: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  const data = asRecord(payload?.data);
+  if (Array.isArray(data?.results)) {
+    return data;
+  }
+
+  const rawOutput = asRecord(data?.rawOutput);
+  return parseJsonRecord(asTrimmedString(rawOutput?.content));
+}
+
+function extractBatchResults(
+  payload: Record<string, unknown> | null,
+): NonNullable<WorkLogEntry["batchResults"]> {
+  const source = extractBatchResultSource(payload);
+  const results = Array.isArray(source?.results) ? source.results : [];
+  return results.flatMap((result) => {
+    const record = asRecord(result);
+    if (!record) {
+      return [];
+    }
+
+    const tool = asTrimmedString(record.tool) ?? "tool";
+    const content = asTrimmedString(record.content);
+    const artifactId = asTrimmedString(record.artifactId);
+    return [
+      {
+        tool,
+        ok: record.ok === true,
+        summary:
+          summarizeBatchResultContent(content) ?? (record.ok === true ? "completed" : "failed"),
+        ...(artifactId ? { artifactId } : {}),
+      },
+    ];
+  });
+}
+
+function normalizeWebSource(value: unknown, status: "ok" | "failed"): WorkLogWebSource | null {
+  const record = asRecord(value);
+  const url = asTrimmedString(record?.url);
+  if (!record || !url) return null;
+  const title = asTrimmedString(record.title);
+  const publishedDate = asTrimmedString(record.publishedDate);
+  const author = asTrimmedString(record.author);
+  const text = asTrimmedString(record.text);
+  const error = asTrimmedString(record.error);
+  return {
+    url,
+    status,
+    ...(title ? { title } : {}),
+    ...(publishedDate ? { publishedDate } : {}),
+    ...(author ? { author } : {}),
+    ...(text ? { text } : {}),
+    ...(error ? { error } : {}),
+  };
+}
+
+function extractWebSources(payload: Record<string, unknown> | null): WorkLogWebSource[] {
+  if (extractWorkLogItemType(payload) !== "web_search") return [];
+  const data = asRecord(payload?.data);
+  const resultItems = Array.isArray(data?.results) ? data.results : [];
+  const pageItems = Array.isArray(data?.pages) ? data.pages : [];
+  const failureItems = Array.isArray(data?.failures) ? data.failures : [];
+  return [
+    ...resultItems.flatMap((entry) => {
+      const source = normalizeWebSource(entry, "ok");
+      return source ? [source] : [];
+    }),
+    ...pageItems.flatMap((entry) => {
+      const source = normalizeWebSource(entry, "ok");
+      return source ? [source] : [];
+    }),
+    ...failureItems.flatMap((entry) => {
+      const source = normalizeWebSource(entry, "failed");
+      return source ? [source] : [];
+    }),
+  ];
+}
+
+function extractTodoList(payload: Record<string, unknown> | null): WorkLogTodoList | undefined {
+  const metadata = asRecord(payload?.metadata);
+  if (metadata?.kind !== "todo_list") return undefined;
+  const itemsRaw = Array.isArray(metadata.items) ? metadata.items : [];
+  const items = itemsRaw.flatMap((itemRaw) => {
+    const item = asRecord(itemRaw);
+    const id = asTrimmedString(item?.id);
+    const content = asTrimmedString(item?.content);
+    if (!id || !content) return [];
+    const status = normalizeTodoStatus(item?.status);
+    return [
+      {
+        id,
+        content,
+        status,
+        ...(typeof item?.updatedAt === "string" ? { updatedAt: item.updatedAt } : {}),
+      },
+    ];
+  });
+  if (items.length === 0) return undefined;
+  const countsRaw = asRecord(metadata.counts);
+  const counts = {
+    pending: numberCount(countsRaw?.pending),
+    inProgress: numberCount(countsRaw?.in_progress ?? countsRaw?.inProgress),
+    completed: numberCount(countsRaw?.completed),
+    blocked: numberCount(countsRaw?.blocked),
+  };
+  return {
+    ...(typeof metadata.reason === "string" && metadata.reason.trim()
+      ? { reason: metadata.reason.trim() }
+      : {}),
+    counts,
+    items,
+  };
+}
+
+function normalizeTodoStatus(value: unknown): WorkLogTodoList["items"][number]["status"] {
+  return value === "in_progress" || value === "inProgress"
+    ? "inProgress"
+    : value === "completed" || value === "blocked" || value === "pending"
+      ? value
+      : "pending";
+}
+
+function numberCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
 function summarizeToolRawOutput(payload: Record<string, unknown> | null): string | null {
+  const batchResults = extractBatchResults(payload);
+  if (batchResults.length > 0) {
+    return `${batchResults.length.toLocaleString()} batched tool${
+      batchResults.length === 1 ? "" : "s"
+    }`;
+  }
+
   const data = asRecord(payload?.data);
   const rawOutput = asRecord(data?.rawOutput);
   if (!rawOutput) {
@@ -964,6 +1281,42 @@ function summarizeToolRawOutput(payload: Record<string, unknown> | null): string
   }
 
   return null;
+}
+
+function extractToolOutput(payload: Record<string, unknown> | null): {
+  output: string | null;
+  outputLabel: string | null;
+  outputTruncated: boolean;
+} {
+  const data = asRecord(payload?.data);
+  const rawOutput = asRecord(data?.rawOutput);
+  const isBatchOutput = data?.kind === "batch" || extractBatchResults(payload).length > 0;
+  const stdout = asTrimmedString(rawOutput?.stdout);
+  const stderr = asTrimmedString(rawOutput?.stderr);
+  const content = isBatchOutput ? null : asTrimmedString(rawOutput?.content);
+  const parts: string[] = [];
+  let outputLabel: string | null = null;
+
+  if (stdout) {
+    parts.push(stdout);
+    outputLabel = "stdout";
+  }
+  if (stderr) {
+    parts.push(`${stdout ? "\n\n" : ""}stderr:\n${stderr}`);
+    outputLabel = stdout ? "stdout + stderr" : "stderr";
+  }
+  if (parts.length === 0 && content) {
+    parts.push(content);
+    outputLabel = "output";
+  }
+  return {
+    output: parts.join(""),
+    outputLabel,
+    outputTruncated:
+      rawOutput?.truncated === true ||
+      rawOutput?.stdoutTruncated === true ||
+      rawOutput?.stderrTruncated === true,
+  };
 }
 
 function isCommandToolDetail(payload: Record<string, unknown> | null, heading: string): boolean {
@@ -1179,12 +1532,14 @@ export function deriveTimelineEntries(
     createdAt: proposedPlan.createdAt,
     proposedPlan,
   }));
-  const workRows: TimelineEntry[] = workEntries.map((entry) => ({
-    id: entry.id,
-    kind: "work",
-    createdAt: entry.createdAt,
-    entry,
-  }));
+  const workRows: TimelineEntry[] = workEntries
+    .filter((entry) => entry.visibleInTimeline !== false)
+    .map((entry) => ({
+      id: entry.id,
+      kind: "work",
+      createdAt: entry.createdAt,
+      entry,
+    }));
   return [...messageRows, ...proposedPlanRows, ...workRows].toSorted((a, b) =>
     a.createdAt.localeCompare(b.createdAt),
   );

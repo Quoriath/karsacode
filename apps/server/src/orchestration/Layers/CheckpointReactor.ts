@@ -11,7 +11,10 @@ import {
 import { Cause, Effect, Layer, Option, Stream } from "effect";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
-import { parseTurnDiffFilesFromUnifiedDiff } from "../../checkpointing/Diffs.ts";
+import {
+  inferTurnDiffFileKind,
+  parseTurnDiffFilesFromUnifiedDiff,
+} from "../../checkpointing/Diffs.ts";
 import {
   checkpointRefForThreadTurn,
   resolveThreadWorkspaceCwd,
@@ -242,7 +245,7 @@ const make = Effect.gen(function* () {
         Effect.map((diff) =>
           parseTurnDiffFilesFromUnifiedDiff(diff).map((file) => ({
             path: file.path,
-            kind: "modified" as const,
+            kind: inferTurnDiffFileKind(diff, file.path),
             additions: file.additions,
             deletions: file.deletions,
           })),

@@ -57,6 +57,8 @@ async function buildSnapshot(input: {
     warnings.push("ripgrep not found; search_repo will use fallback search.");
   if (input.config.preferFd && !(await commandExists("fd")))
     warnings.push("fd not found; list_files will use fallback listing.");
+  if (!input.environment.EXA_API_KEY && !process.env.EXA_API_KEY)
+    warnings.push("EXA_API_KEY not configured; web_search/web_fetch tools are unavailable.");
   const unavailable = warnings.some(
     (warning) => warning.startsWith("Missing API key") || warning.startsWith("Invalid workspace"),
   );
@@ -119,6 +121,7 @@ export const CustomAgentDriver: ProviderDriver<CustomAgentSettings, CustomAgentD
         settings: effectiveConfig,
         workspaceRoot,
         backend,
+        environment: processEnv,
       }).pipe(
         Effect.mapError(
           (cause) =>

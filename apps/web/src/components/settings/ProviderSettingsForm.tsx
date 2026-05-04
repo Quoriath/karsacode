@@ -171,7 +171,13 @@ export function readProviderConfigNumberRecordInput(config: unknown, key: string
 export function nextProviderConfigWithFieldValue(
   config: unknown,
   field: ProviderSettingsFieldModel,
-  value: string | boolean | number | ReadonlyArray<string> | Readonly<Record<string, string>>,
+  value:
+    | string
+    | boolean
+    | number
+    | ReadonlyArray<string>
+    | Readonly<Record<string, string>>
+    | Readonly<Record<string, number>>,
 ): Record<string, unknown> | undefined {
   const base: Record<string, unknown> =
     config !== null && typeof config === "object" ? { ...(config as Record<string, unknown>) } : {};

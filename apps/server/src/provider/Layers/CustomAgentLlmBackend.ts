@@ -11,6 +11,7 @@ export interface CustomAgentLlmInput {
   readonly temperature?: number | undefined;
   readonly stream?: boolean | undefined;
   readonly maxOutputTokens?: number | undefined;
+  readonly signal?: AbortSignal | undefined;
 }
 
 export interface CustomAgentLlmOutput {
@@ -57,6 +58,18 @@ function describeFetchFailure(error: unknown, url: string): string {
     causeMessage || message,
     "Check API endpoint/base URL, network access, TLS/proxy settings, and whether the endpoint supports OpenAI-compatible /chat/completions.",
   ].join(" ");
+}
+
+function isAbortFailure(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError")
+  );
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw new DOMException("Aborted", "AbortError");
 }
 
 export function buildCustomAgentAuthHeaders(
@@ -238,8 +251,9 @@ export function makeOpenAiCompatibleCustomAgentBackend(
     url: string,
     authHeaders: Record<string, string>,
     body: string,
-  ): Promise<Response> =>
-    await fetch(url, {
+    signal?: AbortSignal | undefined,
+  ): Promise<Response> => {
+    const init: RequestInit = {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -247,7 +261,10 @@ export function makeOpenAiCompatibleCustomAgentBackend(
         ...settings.apiHeaders,
       },
       body,
-    });
+      ...(signal !== undefined ? { signal } : {}),
+    };
+    return await fetch(url, init);
+  };
   const getJson = async (url: string, authHeaders: Record<string, string>): Promise<Response> =>
     await fetch(url, {
       method: "GET",
@@ -260,20 +277,21 @@ export function makeOpenAiCompatibleCustomAgentBackend(
   const postWithLocalAuthFallbacks = async (
     body: string,
     authHeaders: Record<string, string>,
+    signal?: AbortSignal | undefined,
   ): Promise<Response> => {
-    let response = await post(chatCompletionsUrl, authHeaders, body);
+    let response = await post(chatCompletionsUrl, authHeaders, body, signal);
     if (response.status !== 401 || !apiKeyValue || !isLocalCustomAgentEndpoint(chatCompletionsUrl))
       return response;
     for (const fallbackHeaders of localAuthFallbackHeaders(settings, apiKeyValue).slice(1)) {
-      response = await post(chatCompletionsUrl, fallbackHeaders, body);
+      response = await post(chatCompletionsUrl, fallbackHeaders, body, signal);
       if (response.ok || response.status !== 401) return response;
     }
     for (const fallbackUrl of localAuthFallbackUrls(chatCompletionsUrl, apiKeyValue)) {
-      response = await post(fallbackUrl, {}, body);
+      response = await post(fallbackUrl, {}, body, signal);
       if (response.ok || response.status !== 401) return response;
     }
     for (const fallbackUrl of localAuthFallbackUrls(chatCompletionsUrl, apiKeyValue)) {
-      response = await post(fallbackUrl, authHeaders, body);
+      response = await post(fallbackUrl, authHeaders, body, signal);
       if (response.ok || response.status !== 401) return response;
     }
     return response;
@@ -286,8 +304,13 @@ export function makeOpenAiCompatibleCustomAgentBackend(
       throw new Error(`Missing API key environment variable: ${settings.apiKeyEnvVar}`);
     try {
       const authHeaders = buildCustomAgentAuthHeaders(settings, apiKeyValue);
-      return await postWithLocalAuthFallbacks(buildRequestBody(input, stream), authHeaders);
+      return await postWithLocalAuthFallbacks(
+        buildRequestBody(input, stream),
+        authHeaders,
+        input.signal,
+      );
     } catch (error) {
+      if (input.signal?.aborted || isAbortFailure(error)) throw error;
       throw new Error(describeFetchFailure(error, chatCompletionsUrl), { cause: error });
     }
   };
@@ -377,6 +400,7 @@ export function makeOpenAiCompatibleCustomAgentBackend(
   };
   const complete = async (input: CustomAgentLlmInput): Promise<CustomAgentLlmOutput> => {
     lastUsage = undefined;
+    throwIfAborted(input.signal);
     const response = await fetchChatCompletions(input, false);
     if (!response.ok)
       throw new Error(
@@ -398,6 +422,7 @@ export function makeOpenAiCompatibleCustomAgentBackend(
   };
   const stream = async function* (input: CustomAgentLlmInput): AsyncIterable<string> {
     lastUsage = undefined;
+    throwIfAborted(input.signal);
     const response = await fetchChatCompletions(input, true);
     if (!response.ok)
       throw new Error(
@@ -421,7 +446,9 @@ export function makeOpenAiCompatibleCustomAgentBackend(
       return false;
     };
     while (true) {
+      throwIfAborted(input.signal);
       const { value, done } = await reader.read();
+      throwIfAborted(input.signal);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split(/\r?\n/);
@@ -438,6 +465,7 @@ export function makeOpenAiCompatibleCustomAgentBackend(
         }
       }
     }
+    throwIfAborted(input.signal);
     const trailing = decoder.decode();
     if (trailing) buffer += trailing;
     for (const line of buffer.split(/\r?\n/)) {
@@ -483,11 +511,22 @@ export function makeFakeCustomAgentBackend(outputs: ReadonlyArray<string>): Cust
   };
 }
 
+export type CustomAgentModelToolCall = {
+  readonly tool: string;
+  readonly args: Record<string, unknown>;
+  readonly reason?: string | undefined;
+};
+
 export type CustomAgentModelCommand =
   | {
       readonly type: "tool_call";
       readonly tool: string;
       readonly args: Record<string, unknown>;
+      readonly reason?: string | undefined;
+    }
+  | {
+      readonly type: "tool_calls";
+      readonly calls: ReadonlyArray<CustomAgentModelToolCall>;
       readonly reason?: string | undefined;
     }
   | { readonly type: "final"; readonly content: string };
@@ -520,8 +559,36 @@ export function parseCustomAgentModelCommand(
         reason: typeof record.reason === "string" ? record.reason : undefined,
       },
     };
+  if (record.type === "tool_calls" && Array.isArray(record.calls)) {
+    const calls = record.calls.slice(0, 6).map((call): CustomAgentModelToolCall | undefined => {
+      if (!call || typeof call !== "object" || Array.isArray(call)) return undefined;
+      const callRecord = call as Record<string, unknown>;
+      if (
+        typeof callRecord.tool !== "string" ||
+        (callRecord.args !== undefined &&
+          (typeof callRecord.args !== "object" || Array.isArray(callRecord.args)))
+      )
+        return undefined;
+      return {
+        tool: callRecord.tool,
+        args: (callRecord.args ?? {}) as Record<string, unknown>,
+        reason: typeof callRecord.reason === "string" ? callRecord.reason : undefined,
+      };
+    });
+    const validCalls = calls.filter((call): call is CustomAgentModelToolCall => call !== undefined);
+    if (validCalls.length > 0 && validCalls.length === calls.length)
+      return {
+        ok: true,
+        command: {
+          type: "tool_calls",
+          calls: validCalls,
+          reason: typeof record.reason === "string" ? record.reason : undefined,
+        },
+      };
+  }
   return {
     ok: false,
-    error: "Model JSON must be {type:'tool_call', tool, args} or {type:'final', content}.",
+    error:
+      "Model JSON must be {type:'tool_call', tool, args}, {type:'tool_calls', calls:[...]}, or {type:'final', content}.",
   };
 }

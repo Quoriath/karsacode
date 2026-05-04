@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 
-type Theme =
+export type Theme =
   | "system"
   | "light"
   | "dark"
@@ -132,10 +132,21 @@ function applyCustomTheme(theme: Theme) {
 
   // Set data-theme attribute for custom themes, remove for basic themes
   if (theme === "system" || theme === "light" || theme === "dark") {
-    document.documentElement.removeAttribute("data-theme");
+    document.documentElement.removeAttribute?.("data-theme");
   } else {
-    document.documentElement.setAttribute("data-theme", theme);
+    document.documentElement.setAttribute?.("data-theme", theme);
   }
+}
+
+function isLightTheme(theme: Theme) {
+  return (
+    theme === "light" ||
+    theme === "github-light" ||
+    theme === "catppuccin-latte" ||
+    theme === "vscode-light" ||
+    theme === "gruvbox-light" ||
+    theme === "solarized-light"
+  );
 }
 
 function applyTheme(theme: Theme, suppressTransitions = false) {
@@ -153,15 +164,7 @@ function applyTheme(theme: Theme, suppressTransitions = false) {
   } else if (theme === "light") {
     isDark = false;
   } else {
-    // Custom themes: determine from the theme name
-    const lightThemes = [
-      "github-light",
-      "catppuccin-latte",
-      "vscode-light",
-      "gruvbox-light",
-      "solarized-light",
-    ];
-    isDark = !lightThemes.includes(theme);
+    isDark = !isLightTheme(theme);
   }
 
   document.documentElement.classList.toggle("dark", isDark);
@@ -189,11 +192,19 @@ function syncDesktopTheme(theme: Theme) {
   }
 
   lastDesktopTheme = theme;
-  void bridge.setTheme(theme).catch(() => {
+  void bridge.setTheme(toDesktopTheme(theme)).catch(() => {
     if (lastDesktopTheme === theme) {
       lastDesktopTheme = null;
     }
   });
+}
+
+function toDesktopTheme(theme: Theme): "light" | "dark" | "system" {
+  if (theme === "system" || theme === "light" || theme === "dark") {
+    return theme;
+  }
+
+  return isLightTheme(theme) ? "light" : "dark";
 }
 
 // Apply immediately on module load to prevent flash
@@ -255,12 +266,7 @@ export function useTheme() {
       ? snapshot.systemDark
         ? "dark"
         : "light"
-      : theme === "light" ||
-          theme === "github-light" ||
-          theme === "catppuccin-latte" ||
-          theme === "vscode-light" ||
-          theme === "gruvbox-light" ||
-          theme === "solarized-light"
+      : isLightTheme(theme)
         ? "light"
         : "dark";
 

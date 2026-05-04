@@ -430,7 +430,6 @@ export const CustomAgentSettings = makeProviderSettingsSchema(
           control: "json-record",
           placeholder: '{ "HTTP-Referer": "https://example.com" }',
           clearWhenEmpty: "omit",
-          hidden: true,
         },
       }),
     ),
@@ -451,6 +450,14 @@ export const CustomAgentSettings = makeProviderSettingsSchema(
         title: "Workspace root",
         description: "Workspace used by the native runtime. Leave blank to use the server cwd.",
         providerSettingsForm: { placeholder: "/path/to/workspace", clearWhenEmpty: "omit" },
+      }),
+    ),
+    homePath: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Home path",
+        description: "Optional isolated home path for the custom agent runtime.",
+        providerSettingsForm: { placeholder: "~/.karsacode-custom-agent", clearWhenEmpty: "omit" },
       }),
     ),
     defaultRuntimeMode: CustomAgentRuntimeMode.pipe(

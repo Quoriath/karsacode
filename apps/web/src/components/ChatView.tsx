@@ -63,6 +63,7 @@ import {
   hasToolActivityForTurn,
   isLatestTurnSettled,
   formatElapsed,
+  type WorkLogTodoList,
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
 import {
@@ -104,7 +105,6 @@ import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
-import { ChevronDownIcon } from "lucide-react";
 import { cn, randomUUID } from "~/lib/utils";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
@@ -178,8 +178,25 @@ import {
   useServerConfig,
   useServerKeybindings,
 } from "~/rpc/serverState";
+import {
+  ChevronDownIcon,
+  CheckIcon,
+  CircleAlertIcon,
+  CircleIcon,
+  EyeOffIcon,
+  HistoryIcon,
+  ListChecksIcon,
+  LoaderCircleIcon,
+  Maximize2Icon,
+  Minimize2Icon,
+  RotateCcwIcon,
+  Trash2Icon,
+  XIcon,
+  type LucideIcon,
+} from "lucide-react";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
 import { retainThreadDetailSubscription } from "../environments/runtime/service";
+import { summarizeTurnDiffStats } from "../lib/turnDiffTree";
 import { RightPanelSheet } from "./RightPanelSheet";
 
 const IMAGE_ONLY_BOOTSTRAP_PROMPT =
@@ -301,6 +318,395 @@ function useThreadPlanCatalog(threadIds: readonly ThreadId[]): ThreadPlanCatalog
         return nextResult;
       };
     }, [threadIds]),
+  );
+}
+
+function ComposerTodoPanel({
+  todoList,
+  expanded,
+  hidden,
+  onExpandedChange,
+  onHiddenChange,
+}: {
+  todoList: WorkLogTodoList | null;
+  expanded: boolean;
+  hidden: boolean;
+  onExpandedChange: (expanded: boolean) => void;
+  onHiddenChange: (hidden: boolean) => void;
+}) {
+  if (!todoList || todoList.items.length === 0) return null;
+
+  const total = todoList.items.length;
+  const completed = todoList.counts.completed;
+  const active = todoList.items.find((item) => item.status === "inProgress") ?? null;
+  const hasBlocked = todoList.counts.blocked > 0;
+  const isDone = total > 0 && completed === total;
+  const progress = total > 0 ? Math.min(100, Math.max(0, (completed / total) * 100)) : 0;
+  const visibleItems = expanded ? todoList.items : active ? [active] : todoList.items.slice(0, 2);
+
+  if (hidden) {
+    return (
+      <div className="mx-auto mb-1.5 flex w-full max-w-3xl justify-start">
+        <button
+          type="button"
+          onClick={() => onHiddenChange(false)}
+          className="inline-flex max-w-full items-center gap-2 rounded-lg border border-border/30 bg-background/35 px-2.5 py-1 text-[11px] text-muted-foreground/70 shadow-sm backdrop-blur transition-colors hover:border-border/55 hover:bg-background/55 hover:text-foreground/80"
+        >
+          <ListChecksIcon className="size-3.5 shrink-0" />
+          <span className="truncate">{composerTodoProgressLabel(todoList)}</span>
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto mb-1.5 w-full max-w-3xl">
+      <div
+        className={cn(
+          "overflow-hidden rounded-xl border bg-background/30 shadow-[0_10px_32px_rgba(0,0,0,0.18)] backdrop-blur-md transition-[border-color,background-color,opacity,transform] duration-200",
+          hasBlocked
+            ? "border-amber-500/20"
+            : isDone
+              ? "border-emerald-500/15"
+              : "border-border/28",
+        )}
+      >
+        <div className="flex items-center gap-2 px-2.5 py-2">
+          <span
+            className={cn(
+              "flex size-6 shrink-0 items-center justify-center rounded-md border bg-background/45",
+              hasBlocked
+                ? "border-amber-500/25 text-amber-300/85"
+                : isDone
+                  ? "border-emerald-500/20 text-emerald-300/85"
+                  : "border-border/45 text-muted-foreground/75",
+            )}
+          >
+            <ListChecksIcon className="size-3.5" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <p className="truncate text-xs font-medium leading-4 text-foreground/84">Todo</p>
+              <span className="shrink-0 text-[10px] text-muted-foreground/50">
+                {composerTodoProgressLabel(todoList)}
+              </span>
+            </div>
+            <div className="mt-1 h-1 overflow-hidden rounded-full bg-muted/25">
+              <div
+                className={cn(
+                  "h-full rounded-full transition-[width,background-color] duration-300",
+                  hasBlocked ? "bg-amber-300/65" : "bg-emerald-300/65",
+                )}
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          </div>
+          <button
+            type="button"
+            aria-label={expanded ? "Collapse todo" : "Expand todo"}
+            className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/55 transition-colors hover:bg-background/45 hover:text-foreground/80"
+            onClick={() => onExpandedChange(!expanded)}
+          >
+            {expanded ? (
+              <Minimize2Icon className="size-3.5" />
+            ) : (
+              <Maximize2Icon className="size-3.5" />
+            )}
+          </button>
+          <button
+            type="button"
+            aria-label="Hide todo"
+            className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/45 transition-colors hover:bg-background/45 hover:text-foreground/75"
+            onClick={() => onHiddenChange(true)}
+          >
+            <EyeOffIcon className="size-3.5" />
+          </button>
+        </div>
+        <div className="px-2.5 pb-2">
+          <div className="rounded-lg bg-background/18 px-2 py-1.5">
+            <div className={cn("grid gap-1", expanded ? "max-h-48 overflow-auto pr-1" : "")}>
+              {visibleItems.map((item) => {
+                const status = composerTodoStatusIcon(item.status);
+                const StatusIcon = status.icon;
+                return (
+                  <div
+                    key={`composer-todo:${item.id}`}
+                    className="grid grid-cols-[1.25rem_minmax(0,1fr)] items-start gap-2 text-[11px] leading-4"
+                  >
+                    <span className="flex size-5 items-center justify-center">
+                      <StatusIcon
+                        className={cn(
+                          "size-3",
+                          status.className,
+                          status.spinning ? "animate-spin" : "",
+                        )}
+                      />
+                    </span>
+                    <span
+                      className={cn(
+                        "min-w-0 break-words text-muted-foreground/72",
+                        item.status === "completed" ? "text-muted-foreground/45 line-through" : "",
+                        item.status === "blocked" ? "text-amber-200/75" : "",
+                        item.status === "inProgress" ? "text-foreground/78" : "",
+                      )}
+                    >
+                      {item.content}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            {!expanded && todoList.items.length > visibleItems.length && (
+              <button
+                type="button"
+                className="mt-1 pl-7 text-[10px] text-muted-foreground/45 transition-colors hover:text-muted-foreground/75"
+                onClick={() => onExpandedChange(true)}
+              >
+                Show {todoList.items.length - visibleItems.length} more
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function composerTodoProgressLabel(todoList: WorkLogTodoList): string {
+  const total = todoList.items.length;
+  const completed = todoList.counts.completed;
+  if (todoList.counts.blocked > 0) {
+    return `${completed}/${total} done, ${todoList.counts.blocked} blocked`;
+  }
+  if (todoList.counts.inProgress > 0) {
+    return `${completed}/${total} done, ${todoList.counts.inProgress} active`;
+  }
+  return `${completed}/${total} done`;
+}
+
+function composerTodoStatusIcon(status: WorkLogTodoList["items"][number]["status"]): {
+  icon: LucideIcon;
+  className: string;
+  spinning?: boolean;
+} {
+  if (status === "completed") return { icon: CheckIcon, className: "text-emerald-300/85" };
+  if (status === "inProgress") {
+    return { icon: LoaderCircleIcon, className: "text-sky-300/85", spinning: true };
+  }
+  if (status === "blocked") return { icon: CircleAlertIcon, className: "text-amber-300/85" };
+  return { icon: CircleIcon, className: "text-muted-foreground/45" };
+}
+
+function isDeletedCheckpointFile(file: TurnDiffSummary["files"][number]): boolean {
+  return /delete|deleted|remove|removed/i.test(file.kind ?? "");
+}
+
+function checkpointFileKindLabel(file: TurnDiffSummary["files"][number]): string {
+  if (/add|added|create|created/i.test(file.kind ?? "")) return "added";
+  if (isDeletedCheckpointFile(file)) return "deleted";
+  return "modified";
+}
+
+function checkpointTotals(summary: TurnDiffSummary): {
+  additions: number;
+  deletions: number;
+  deletedFiles: number;
+} {
+  const stat = summarizeTurnDiffStats(summary.files);
+  return {
+    additions: stat.additions,
+    deletions: stat.deletions,
+    deletedFiles: summary.files.filter(isDeletedCheckpointFile).length,
+  };
+}
+
+function formatCheckpointTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function CheckpointRewindDialog({
+  open,
+  checkpoints,
+  pendingCheckpoint,
+  isReverting,
+  onOpenChange,
+  onSelectCheckpoint,
+  onConfirm,
+}: {
+  open: boolean;
+  checkpoints: TurnDiffSummary[];
+  pendingCheckpoint: TurnDiffSummary | null;
+  isReverting: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSelectCheckpoint: (checkpoint: TurnDiffSummary) => void;
+  onConfirm: () => void;
+}) {
+  if (!open && !pendingCheckpoint) return null;
+  const selectedTotals = pendingCheckpoint ? checkpointTotals(pendingCheckpoint) : null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-background/70 p-3 backdrop-blur-sm sm:items-center">
+      <div className="flex max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
+        <div className="flex items-start justify-between gap-3 border-b border-border/70 px-4 py-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <HistoryIcon className="size-4 text-muted-foreground" />
+              Rewind checkpoint
+            </div>
+            <div className="mt-1 text-muted-foreground text-xs">
+              Restore chat, AI context, and workspace state back to a saved checkpoint.
+            </div>
+          </div>
+          <button
+            type="button"
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            onClick={() => onOpenChange(false)}
+          >
+            <XIcon className="size-4" />
+          </button>
+        </div>
+        <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden sm:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+          <div className="min-h-0 overflow-y-auto border-b border-border/70 p-3 sm:border-r sm:border-b-0">
+            {checkpoints.length === 0 ? (
+              <div className="rounded-md border border-border/70 bg-secondary/30 p-3 text-muted-foreground text-xs">
+                No checkpoints are available in this thread yet.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {checkpoints.map((checkpoint) => {
+                  const totals = checkpointTotals(checkpoint);
+                  const selected =
+                    pendingCheckpoint?.checkpointTurnCount === checkpoint.checkpointTurnCount;
+                  return (
+                    <button
+                      key={`${checkpoint.turnId}:${checkpoint.checkpointTurnCount ?? "none"}`}
+                      type="button"
+                      className={cn(
+                        "w-full rounded-md border p-3 text-left transition-colors",
+                        selected
+                          ? "border-primary/55 bg-primary/10"
+                          : "border-border/70 bg-background/30 hover:border-border hover:bg-secondary/45",
+                      )}
+                      onClick={() => onSelectCheckpoint(checkpoint)}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="truncate text-xs font-medium">
+                          Checkpoint {checkpoint.checkpointTurnCount ?? "-"}
+                        </div>
+                        <div className="shrink-0 text-muted-foreground text-[11px]">
+                          {formatCheckpointTime(checkpoint.completedAt)}
+                        </div>
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1.5 text-[11px]">
+                        <span className="rounded border border-border/60 px-1.5 py-0.5 text-muted-foreground">
+                          {checkpoint.files.length} files
+                        </span>
+                        <span className="rounded border border-emerald-500/25 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-300">
+                          +{totals.additions}
+                        </span>
+                        <span className="rounded border border-rose-500/25 bg-rose-500/10 px-1.5 py-0.5 text-rose-300">
+                          -{totals.deletions}
+                        </span>
+                        {totals.deletedFiles > 0 ? (
+                          <span className="rounded border border-amber-500/25 bg-amber-500/10 px-1.5 py-0.5 text-amber-300">
+                            {totals.deletedFiles} deleted
+                          </span>
+                        ) : null}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          <div className="min-h-0 overflow-y-auto p-3">
+            {pendingCheckpoint && selectedTotals ? (
+              <div className="space-y-3">
+                <div className="rounded-md border border-border/70 bg-secondary/25 p-3">
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <RotateCcwIcon className="size-4 text-muted-foreground" />
+                    Confirm rewind to checkpoint {pendingCheckpoint.checkpointTurnCount ?? "-"}
+                  </div>
+                  <div className="mt-2 text-muted-foreground text-xs">
+                    Newer messages, context, and workspace changes after this checkpoint will be
+                    discarded.
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-1.5 text-[11px]">
+                    <span className="rounded border border-border/60 px-1.5 py-0.5">
+                      {pendingCheckpoint.files.length} files
+                    </span>
+                    <span className="rounded border border-emerald-500/25 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-300">
+                      +{selectedTotals.additions}
+                    </span>
+                    <span className="rounded border border-rose-500/25 bg-rose-500/10 px-1.5 py-0.5 text-rose-300">
+                      -{selectedTotals.deletions}
+                    </span>
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  {pendingCheckpoint.files.map((file) => (
+                    <div
+                      key={file.path}
+                      className="flex items-center gap-2 rounded-md border border-border/60 bg-background/35 px-2.5 py-2 text-xs"
+                    >
+                      {isDeletedCheckpointFile(file) ? (
+                        <Trash2Icon className="size-3.5 shrink-0 text-amber-300" />
+                      ) : (
+                        <CircleIcon className="size-3.5 shrink-0 text-muted-foreground/55" />
+                      )}
+                      <div className="min-w-0 flex-1 truncate font-mono text-[11px]">
+                        {file.path}
+                      </div>
+                      <div
+                        className={cn(
+                          "shrink-0 rounded border px-1.5 py-0.5 text-[10px]",
+                          checkpointFileKindLabel(file) === "added" &&
+                            "border-emerald-500/25 bg-emerald-500/10 text-emerald-300",
+                          checkpointFileKindLabel(file) === "deleted" &&
+                            "border-amber-500/25 bg-amber-500/10 text-amber-300",
+                          checkpointFileKindLabel(file) === "modified" &&
+                            "border-border/60 text-muted-foreground",
+                        )}
+                      >
+                        {checkpointFileKindLabel(file)}
+                      </div>
+                      <div className="shrink-0 text-emerald-300 text-[11px]">
+                        +{file.additions ?? 0}
+                      </div>
+                      <div className="shrink-0 text-rose-300 text-[11px]">
+                        -{file.deletions ?? 0}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    className="rounded-md border border-border px-3 py-1.5 text-muted-foreground text-xs transition-colors hover:bg-secondary hover:text-foreground"
+                    onClick={() => onOpenChange(false)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-md bg-primary px-3 py-1.5 text-primary-foreground text-xs transition-opacity hover:opacity-90 disabled:opacity-60"
+                    disabled={isReverting}
+                    onClick={onConfirm}
+                  >
+                    {isReverting ? "Rewinding..." : "Rewind"}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-md border border-border/70 bg-secondary/20 p-3 text-muted-foreground text-xs">
+                Select a checkpoint to inspect the files that will be restored.
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -621,10 +1027,7 @@ export default function ChatView(props: ChatViewProps) {
   const timestampFormat = settings.timestampFormat;
   const autoOpenPlanSidebar = settings.autoOpenPlanSidebar;
   const navigate = useNavigate();
-  const rawSearch = useSearch({
-    strict: false,
-    select: (params) => parseDiffRouteSearch(params),
-  });
+  const routeSearch = useSearch({ strict: false });
   const { resolvedTheme } = useTheme();
   // Granular store selectors — avoid subscribing to prompt changes.
   const composerRuntimeMode = useComposerDraftStore(
@@ -690,6 +1093,7 @@ export default function ChatView(props: ChatViewProps) {
   const shouldUsePlanSidebarSheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
   // Tracks whether the user explicitly dismissed the sidebar for the active turn.
   const planSidebarDismissedForTurnRef = useRef<string | null>(null);
+  const planSidebarAutoOpenedForTurnRef = useRef<string | null>(null);
   // When set, the thread-change reset effect will open the sidebar instead of closing it.
   // Used by "Implement in a new thread" to carry the sidebar-open intent across navigation.
   const planSidebarOpenOnNextThreadRef = useRef(false);
@@ -795,7 +1199,7 @@ export default function ChatView(props: ChatViewProps) {
     composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE;
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = isLocalDraftThread;
-  const diffOpen = rawSearch.diff === "1";
+  const diffOpen = parseDiffRouteSearch(routeSearch).diff === "1";
   const activeThreadId = activeThread?.id ?? null;
   const activeThreadRef = useMemo(
     () => (activeThread ? scopeThreadRef(activeThread.environmentId, activeThread.id) : null),
@@ -1072,6 +1476,13 @@ export default function ChatView(props: ChatViewProps) {
     () => deriveWorkLogEntries(threadActivities, activeLatestTurn?.turnId ?? undefined),
     [activeLatestTurn?.turnId, threadActivities],
   );
+  const activeTodoList = useMemo(() => {
+    for (let index = workLogEntries.length - 1; index >= 0; index -= 1) {
+      const todoList = workLogEntries[index]?.todoList;
+      if (todoList) return todoList;
+    }
+    return null;
+  }, [workLogEntries]);
   const latestTurnHasToolActivity = useMemo(
     () => hasToolActivityForTurn(threadActivities, activeLatestTurn?.turnId),
     [activeLatestTurn?.turnId, threadActivities],
@@ -1162,6 +1573,16 @@ export default function ChatView(props: ChatViewProps) {
     threadError: activeThread?.error,
   });
   const isWorking = phase === "running" || isSendBusy || isConnecting || isRevertingCheckpoint;
+  const [todoPanelExpanded, setTodoPanelExpanded] = useState(false);
+  const [todoPanelHidden, setTodoPanelHidden] = useState(false);
+  const [rewindDialogOpen, setRewindDialogOpen] = useState(false);
+  const [pendingRewindCheckpoint, setPendingRewindCheckpoint] = useState<TurnDiffSummary | null>(
+    null,
+  );
+  useEffect(() => {
+    setTodoPanelExpanded((expanded) => (expanded ? false : expanded));
+    setTodoPanelHidden((hidden) => (hidden ? false : hidden));
+  }, [activeThread?.id]);
   const activeWorkStartedAt = deriveActiveWorkStartedAt(
     activeLatestTurn,
     activeThread?.session ?? null,
@@ -1368,6 +1789,15 @@ export default function ChatView(props: ChatViewProps) {
   );
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
     useTurnDiffSummaries(activeThread);
+  const rewindCheckpoints = useMemo(
+    () =>
+      turnDiffSummaries
+        .filter((summary) => typeof summary.checkpointTurnCount === "number")
+        .toSorted(
+          (left, right) => (right.checkpointTurnCount ?? 0) - (left.checkpointTurnCount ?? 0),
+        ),
+    [turnDiffSummaries],
+  );
   const turnDiffSummaryByAssistantMessageId = useMemo(() => {
     const byMessageId = new Map<MessageId, TurnDiffSummary>();
     for (const summary of turnDiffSummaries) {
@@ -2041,21 +2471,28 @@ export default function ChatView(props: ChatViewProps) {
       setPlanSidebarOpen(false);
     }
     planSidebarDismissedForTurnRef.current = null;
+    planSidebarAutoOpenedForTurnRef.current = null;
   }, [activeThread?.id]);
+
+  const activePlanTurnId = activePlan?.turnId ?? null;
+  const activePlanStepCount = activePlan?.steps.length ?? 0;
 
   // Auto-open the plan sidebar when plan/todo steps arrive for the current turn.
   // Don't auto-open for plans carried over from a previous turn (the user can open manually).
   useEffect(() => {
     if (!autoOpenPlanSidebar) return;
-    if (!activePlan) return;
+    if (!activePlanTurnId || activePlanStepCount === 0) return;
     if (planSidebarOpen) return;
     const latestTurnId = activeLatestTurn?.turnId ?? null;
-    if (latestTurnId && activePlan.turnId !== latestTurnId) return;
-    const turnKey = activePlan.turnId ?? sidebarProposedPlan?.turnId ?? "__dismissed__";
+    if (latestTurnId && activePlanTurnId !== latestTurnId) return;
+    const turnKey = activePlanTurnId ?? sidebarProposedPlan?.turnId ?? "__dismissed__";
     if (planSidebarDismissedForTurnRef.current === turnKey) return;
+    if (planSidebarAutoOpenedForTurnRef.current === turnKey) return;
+    planSidebarAutoOpenedForTurnRef.current = turnKey;
     setPlanSidebarOpen(true);
   }, [
-    activePlan,
+    activePlanStepCount,
+    activePlanTurnId,
     activeLatestTurn?.turnId,
     autoOpenPlanSidebar,
     planSidebarOpen,
@@ -2356,22 +2793,11 @@ export default function ChatView(props: ChatViewProps) {
   const onRevertToTurnCount = useCallback(
     async (turnCount: number) => {
       const api = readEnvironmentApi(environmentId);
-      const localApi = readLocalApi();
-      if (!api || !localApi || !activeThread || isRevertingCheckpoint) return;
+      if (!api || !activeThread || isRevertingCheckpoint) return false;
 
       if (phase === "running" || isSendBusy || isConnecting) {
         setThreadError(activeThread.id, "Interrupt the current turn before reverting checkpoints.");
-        return;
-      }
-      const confirmed = await localApi.dialogs.confirm(
-        [
-          `Revert this thread to checkpoint ${turnCount}?`,
-          "This will discard newer messages and turn diffs in this thread.",
-          "This action cannot be undone.",
-        ].join("\n"),
-      );
-      if (!confirmed) {
-        return;
+        return false;
       }
 
       setIsRevertingCheckpoint(true);
@@ -2384,13 +2810,16 @@ export default function ChatView(props: ChatViewProps) {
           turnCount,
           createdAt: new Date().toISOString(),
         });
+        return true;
       } catch (err) {
         setThreadError(
           activeThread.id,
           err instanceof Error ? err.message : "Failed to revert thread state.",
         );
+        return false;
+      } finally {
+        setIsRevertingCheckpoint(false);
       }
-      setIsRevertingCheckpoint(false);
     },
     [
       activeThread,
@@ -2401,6 +2830,38 @@ export default function ChatView(props: ChatViewProps) {
       phase,
       setThreadError,
     ],
+  );
+  const requestCheckpointRewind = useCallback((checkpoint: TurnDiffSummary) => {
+    setPendingRewindCheckpoint(checkpoint);
+    setRewindDialogOpen(true);
+  }, []);
+  const openRewindDialog = useCallback(() => {
+    const firstCheckpoint = rewindCheckpoints[0] ?? null;
+    setPendingRewindCheckpoint((current) => current ?? firstCheckpoint);
+    setRewindDialogOpen(true);
+  }, [rewindCheckpoints]);
+  const onConfirmCheckpointRewind = useCallback(() => {
+    const turnCount = pendingRewindCheckpoint?.checkpointTurnCount;
+    if (typeof turnCount !== "number") return;
+    void onRevertToTurnCount(turnCount).then((reverted) => {
+      if (reverted) {
+        setRewindDialogOpen(false);
+        setPendingRewindCheckpoint(null);
+      }
+    });
+  }, [onRevertToTurnCount, pendingRewindCheckpoint]);
+  const requestRewindByTurnCount = useCallback(
+    (turnCount: number) => {
+      const checkpoint = rewindCheckpoints.find(
+        (summary) => summary.checkpointTurnCount === turnCount,
+      );
+      if (checkpoint) {
+        requestCheckpointRewind(checkpoint);
+        return;
+      }
+      void onRevertToTurnCount(turnCount);
+    },
+    [onRevertToTurnCount, requestCheckpointRewind, rewindCheckpoints],
   );
 
   const onSend = async (e?: { preventDefault: () => void }) => {
@@ -2423,6 +2884,13 @@ export default function ChatView(props: ChatViewProps) {
       selectedModelSelection: ctxSelectedModelSelection,
     } = sendCtx;
     const promptForSend = promptRef.current;
+    if (promptForSend.trim() === "/rewind") {
+      openRewindDialog();
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState({ prompt: "", cursor: 0, detectTrigger: false });
+      return;
+    }
     const {
       trimmedPrompt: trimmed,
       sendableTerminalContexts: sendableComposerTerminalContexts,
@@ -2452,7 +2920,11 @@ export default function ChatView(props: ChatViewProps) {
         ? parseStandaloneComposerSlashCommand(trimmed)
         : null;
     if (standaloneSlashCommand) {
-      handleInteractionModeChange(standaloneSlashCommand);
+      if (standaloneSlashCommand === "rewind") {
+        openRewindDialog();
+      } else {
+        handleInteractionModeChange(standaloneSlashCommand);
+      }
       promptRef.current = "";
       clearComposerDraftContent(composerDraftTarget);
       composerRef.current?.resetCursorState();
@@ -3266,14 +3738,14 @@ export default function ChatView(props: ChatViewProps) {
   // the callback reference is fully stable and never busts context identity.
   const revertTurnCountRef = useRef(revertTurnCountByUserMessageId);
   revertTurnCountRef.current = revertTurnCountByUserMessageId;
-  const onRevertToTurnCountRef = useRef(onRevertToTurnCount);
-  onRevertToTurnCountRef.current = onRevertToTurnCount;
+  const requestRewindByTurnCountRef = useRef(requestRewindByTurnCount);
+  requestRewindByTurnCountRef.current = requestRewindByTurnCount;
   const onRevertUserMessage = useCallback((messageId: MessageId) => {
     const targetTurnCount = revertTurnCountRef.current.get(messageId);
     if (typeof targetTurnCount !== "number") {
       return;
     }
-    void onRevertToTurnCountRef.current(targetTurnCount);
+    requestRewindByTurnCountRef.current(targetTurnCount);
   }, []);
 
   // Empty state: no active thread
@@ -3388,6 +3860,13 @@ export default function ChatView(props: ChatViewProps) {
                 : "pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:pb-[calc(env(safe-area-inset-bottom)+1rem)]",
             )}
           >
+            <ComposerTodoPanel
+              todoList={activeTodoList}
+              expanded={todoPanelExpanded}
+              hidden={todoPanelHidden}
+              onExpandedChange={setTodoPanelExpanded}
+              onHiddenChange={setTodoPanelHidden}
+            />
             <ChatComposer
               ref={composerRef}
               composerDraftTarget={composerDraftTarget}
@@ -3438,6 +3917,7 @@ export default function ChatView(props: ChatViewProps) {
               scheduleStickToBottom={scrollToEnd}
               onSend={onSend}
               onInterrupt={onInterrupt}
+              onOpenRewind={openRewindDialog}
               onImplementPlanInNewThread={onImplementPlanInNewThread}
               onRespondToApproval={onRespondToApproval}
               onSelectActivePendingUserInputOption={onSelectActivePendingUserInputOption}
@@ -3500,6 +3980,18 @@ export default function ChatView(props: ChatViewProps) {
               onPrepared={handlePreparedPullRequestThread}
             />
           ) : null}
+          <CheckpointRewindDialog
+            open={rewindDialogOpen}
+            checkpoints={rewindCheckpoints}
+            pendingCheckpoint={pendingRewindCheckpoint}
+            isReverting={isRevertingCheckpoint}
+            onOpenChange={(open) => {
+              setRewindDialogOpen(open);
+              if (!open) setPendingRewindCheckpoint(null);
+            }}
+            onSelectCheckpoint={requestCheckpointRewind}
+            onConfirm={onConfirmCheckpointRewind}
+          />
         </div>
         {/* end chat column */}
 

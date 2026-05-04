@@ -18,6 +18,7 @@ import ChatMarkdown from "../ChatMarkdown";
 import {
   BotIcon,
   CheckIcon,
+  ChevronDownIcon,
   CircleAlertIcon,
   EyeIcon,
   GlobeIcon,
@@ -457,24 +458,11 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
       )}
 
       {row.kind === "working" && (
-        <div className="py-0.5 pl-1.5">
-          <div className="flex items-center gap-2 pt-1 text-[11px] text-muted-foreground/70">
-            <span className="inline-flex items-center gap-[3px]">
-              <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse" />
-              <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:200ms]" />
-              <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:400ms]" />
-            </span>
-            <span>
-              {row.createdAt ? (
-                <>
-                  Working for <WorkingTimer createdAt={row.createdAt} />
-                </>
-              ) : (
-                "Working..."
-              )}
-            </span>
-          </div>
-        </div>
+        <WorkingStatusRow
+          activeWorkEntry={row.activeWorkEntry}
+          createdAt={row.createdAt}
+          workspaceRoot={ctx.workspaceRoot}
+        />
       )}
     </div>
   );
@@ -494,6 +482,72 @@ function WorkingTimer({ createdAt }: { createdAt: string }) {
     return () => clearInterval(id);
   }, [createdAt]);
   return <>{formatWorkingTimer(createdAt, new Date(nowMs).toISOString()) ?? "0s"}</>;
+}
+
+function WorkingStatusRow({
+  activeWorkEntry,
+  createdAt,
+  workspaceRoot,
+}: {
+  activeWorkEntry: TimelineWorkEntry | undefined;
+  createdAt: string | null;
+  workspaceRoot: string | undefined;
+}) {
+  const ActivityIcon = activeWorkEntry ? workEntryIcon(activeWorkEntry) : BotIcon;
+  const heading = activeWorkEntry?.todoList
+    ? "Updating todo plan"
+    : activeWorkEntry
+      ? toolWorkEntryHeading(activeWorkEntry)
+      : "Deciding next action";
+  const rawPreview = activeWorkEntry ? workEntryPreview(activeWorkEntry, workspaceRoot) : null;
+  const todoPreview = activeWorkEntry?.todoList
+    ? formatTodoListProgress(activeWorkEntry.todoList)
+    : null;
+  const preview =
+    !todoPreview &&
+    rawPreview &&
+    normalizeCompactToolLabel(rawPreview).toLowerCase() ===
+      normalizeCompactToolLabel(heading).toLowerCase()
+      ? null
+      : rawPreview;
+  const batchResults = activeWorkEntry?.batchResults ?? [];
+  const batchPreview =
+    batchResults.length > 0
+      ? `${batchResults.length} batched tool${batchResults.length === 1 ? "" : "s"}`
+      : null;
+  const detail = todoPreview ?? preview ?? batchPreview;
+
+  return (
+    <div className="py-0.5 pl-1.5">
+      <div className="flex min-w-0 items-center gap-2 pt-1 text-[11px] text-muted-foreground/70">
+        <span className="inline-flex shrink-0 items-center gap-[3px]">
+          <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse" />
+          <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:200ms]" />
+          <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:400ms]" />
+        </span>
+        <span className="flex size-5 shrink-0 items-center justify-center rounded-md border border-border/35 bg-background/35 text-muted-foreground/55">
+          <ActivityIcon className="size-3" />
+        </span>
+        <span className="min-w-0 flex-1 truncate">
+          <span className="text-muted-foreground/85">
+            {activeWorkEntry ? "Running " : ""}
+            {heading}
+          </span>
+          {detail && <span className="text-muted-foreground/50"> - {detail}</span>}
+          <span className="text-muted-foreground/45">
+            {" "}
+            {createdAt ? (
+              <>
+                for <WorkingTimer createdAt={createdAt} />
+              </>
+            ) : (
+              "..."
+            )}
+          </span>
+        </span>
+      </div>
+    </div>
+  );
 }
 
 /** Live timestamp + elapsed duration for a streaming assistant message. */
@@ -538,8 +592,9 @@ const WorkGroupSection = memo(function WorkGroupSection({
       : groupedEntries;
   const hiddenCount = groupedEntries.length - visibleEntries.length;
   const onlyToolEntries = groupedEntries.every((entry) => entry.tone === "tool");
-  const showHeader = hasOverflow || !onlyToolEntries;
-  const groupLabel = onlyToolEntries ? "Tool calls" : "Work log";
+  const showHeader = hasOverflow || !onlyToolEntries || groupedEntries.length > 1;
+  const parallelCount = visibleWorkParallelCount(groupedEntries);
+  const groupLabel = `Work log - ${visibleWorkToolKindLabel(groupedEntries, onlyToolEntries)} - parallel ${parallelCount}`;
 
   return (
     <div className="rounded-xl border border-border/45 bg-card/25 px-2 py-1.5">
@@ -830,6 +885,37 @@ function formatMessageMeta(
   return `${formatTimestamp(createdAt, timestampFormat)} • ${duration}`;
 }
 
+function visibleWorkParallelCount(entries: ReadonlyArray<TimelineWorkEntry>): number {
+  const batchCount = entries.reduce((total, entry) => total + (entry.batchResults?.length ?? 0), 0);
+  return Math.max(1, batchCount || entries.length);
+}
+
+function visibleWorkToolKindLabel(
+  entries: ReadonlyArray<TimelineWorkEntry>,
+  onlyToolEntries: boolean,
+): string {
+  const labels = new Set(
+    entries.map((entry) => {
+      if ((entry.batchResults?.length ?? 0) > 0) return "Tools";
+      if (entry.requestKind === "command" || entry.itemType === "command_execution") {
+        return "Shell";
+      }
+      if (entry.requestKind === "file-read" || entry.itemType === "image_view") return "Read";
+      if (
+        entry.requestKind === "file-change" ||
+        entry.itemType === "file_change" ||
+        (entry.changedFiles?.length ?? 0) > 0
+      ) {
+        return "Edit";
+      }
+      if (entry.itemType === "web_search") return "Web";
+      if (entry.itemType === "mcp_tool_call") return "MCP";
+      return onlyToolEntries ? "Tools" : "Work";
+    }),
+  );
+  return labels.size === 1 ? (Array.from(labels)[0] ?? "Tools") : "Tools";
+}
+
 function workToneIcon(tone: TimelineWorkEntry["tone"]): {
   icon: LucideIcon;
   className: string;
@@ -890,6 +976,24 @@ function workEntryRawCommand(
   return rawCommand === workEntry.command.trim() ? null : rawCommand;
 }
 
+function truncateToolOutputPreview(value: string): string {
+  const normalized = value
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ");
+  if (normalized.length <= 96) {
+    return normalized;
+  }
+  return `${normalized.slice(0, 95).trimEnd()}...`;
+}
+
+function truncateWebSourcePreview(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 180) return normalized;
+  return `${normalized.slice(0, 179).trimEnd()}...`;
+}
+
 function workEntryIcon(workEntry: TimelineWorkEntry): LucideIcon {
   if (workEntry.requestKind === "command") return TerminalIcon;
   if (workEntry.requestKind === "file-read") return EyeIcon;
@@ -930,6 +1034,20 @@ function toolWorkEntryHeading(workEntry: TimelineWorkEntry): string {
   return capitalizePhrase(normalizeCompactToolLabel(workEntry.toolTitle));
 }
 
+function formatTodoListProgress(todoList: NonNullable<TimelineWorkEntry["todoList"]>): string {
+  const total = todoList.items.length;
+  const completed = todoList.counts.completed;
+  const active = todoList.counts.inProgress;
+  const blocked = todoList.counts.blocked;
+  if (blocked > 0) {
+    return `${completed}/${total} done, ${blocked} blocked`;
+  }
+  if (active > 0) {
+    return `${completed}/${total} done, ${active} active`;
+  }
+  return `${completed}/${total} done`;
+}
+
 const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   workEntry: TimelineWorkEntry;
   workspaceRoot: string | undefined;
@@ -946,15 +1064,45 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
       ? null
       : rawPreview;
   const rawCommand = workEntryRawCommand(workEntry);
+  const output = workEntry.output?.trim() || null;
+  const outputPreview = output ? truncateToolOutputPreview(output) : null;
+  const batchResults = workEntry.batchResults ?? [];
+  const webSources = workEntry.webSources ?? [];
+  const batchPreview =
+    batchResults.length > 0
+      ? `${batchResults.length} tools: ${batchResults
+          .slice(0, 3)
+          .map((result) => normalizeCompactToolLabel(result.tool))
+          .join(", ")}${batchResults.length > 3 ? "..." : ""}`
+      : null;
+  const webPreview =
+    webSources.length > 0
+      ? `${webSources.length} source${webSources.length === 1 ? "" : "s"}: ${
+          webSources[0]?.title ?? webSources[0]?.url ?? "web"
+        }`
+      : null;
+  const hasExpandableContent = Boolean(
+    rawCommand || output || batchResults.length > 0 || webSources.length > 0,
+  );
+  const [isExpanded, setIsExpanded] = useState(false);
   const displayText = preview ? `${heading} - ${preview}` : heading;
   const hasChangedFiles = (workEntry.changedFiles?.length ?? 0) > 0;
   const previewIsChangedFiles = hasChangedFiles && !workEntry.command && !workEntry.detail;
 
   return (
-    <div className="rounded-lg px-1 py-1">
-      <div className="flex items-center gap-2 transition-[opacity,translate] duration-200">
+    <div
+      className={cn(
+        "rounded-lg px-1 py-1 transition-[background-color,border-color,opacity,translate] duration-200",
+        isExpanded ? "bg-background/45" : "hover:bg-background/25",
+      )}
+    >
+      <div className="flex items-center gap-2">
         <span
-          className={cn("flex size-5 shrink-0 items-center justify-center", iconConfig.className)}
+          className={cn(
+            "flex size-5 shrink-0 items-center justify-center rounded-md border border-transparent transition-colors duration-150",
+            isExpanded ? "border-border/45 bg-background/65" : "",
+            iconConfig.className,
+          )}
         >
           <EntryIcon className="size-3" />
         </span>
@@ -1024,8 +1172,146 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
               </TooltipPopup>
             </Tooltip>
           )}
+          {(outputPreview || batchPreview || webPreview) && !isExpanded && (
+            <p className="truncate font-mono text-[10px] leading-4 text-muted-foreground/45">
+              {outputPreview ?? batchPreview ?? webPreview}
+            </p>
+          )}
         </div>
+        {hasExpandableContent && (
+          <button
+            type="button"
+            aria-expanded={isExpanded}
+            className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground/45 transition-colors duration-150 hover:bg-background/70 hover:text-muted-foreground"
+            onClick={() => setIsExpanded((value) => !value)}
+          >
+            <ChevronDownIcon
+              className={cn(
+                "size-3 transition-transform duration-150",
+                isExpanded ? "rotate-180" : "",
+              )}
+            />
+          </button>
+        )}
       </div>
+      {isExpanded && hasExpandableContent && (
+        <div className="mt-1.5 space-y-1 pl-7">
+          {workEntry.command && (
+            <div className="rounded-md border border-border/45 bg-background/70 px-2 py-1.5">
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <span className="text-[9px] uppercase tracking-[0.14em] text-muted-foreground/45">
+                  command
+                </span>
+                {rawCommand && <span className="text-[9px] text-muted-foreground/40">wrapped</span>}
+              </div>
+              <pre className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-4 text-foreground/78">
+                {workEntry.command}
+              </pre>
+              {rawCommand && (
+                <pre className="mt-1 border-t border-border/35 pt-1 overflow-x-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-4 text-muted-foreground/55">
+                  {rawCommand}
+                </pre>
+              )}
+            </div>
+          )}
+          {output && (
+            <div className="overflow-hidden rounded-md border border-border/45 bg-black/20">
+              <div className="flex items-center justify-between gap-2 border-b border-border/35 px-2 py-1">
+                <span className="text-[9px] uppercase tracking-[0.14em] text-muted-foreground/45">
+                  {workEntry.outputLabel ?? "output"}
+                </span>
+                {workEntry.outputTruncated && (
+                  <span className="text-[9px] text-muted-foreground/45">truncated</span>
+                )}
+              </div>
+              <pre className="max-h-72 overflow-auto px-2 py-1.5 font-mono text-[11px] leading-4 whitespace-pre-wrap text-muted-foreground/82">
+                {output}
+              </pre>
+            </div>
+          )}
+          {batchResults.length > 0 && (
+            <div className="overflow-hidden rounded-md border border-border/45 bg-background/70">
+              <div className="flex items-center justify-between gap-2 border-b border-border/35 px-2 py-1">
+                <span className="text-[9px] uppercase tracking-[0.14em] text-muted-foreground/45">
+                  batch tools
+                </span>
+                <span className="text-[9px] text-muted-foreground/40">{batchResults.length}</span>
+              </div>
+              <div className="divide-y divide-border/30">
+                {batchResults.map((result, index) => (
+                  <div
+                    key={`${workEntry.id}:batch:${index}:${result.tool}`}
+                    className="grid grid-cols-[minmax(7rem,0.8fr)_auto_minmax(0,1.4fr)] items-center gap-2 px-2 py-1.5 text-[11px] leading-4"
+                  >
+                    <span className="truncate font-mono text-foreground/78">
+                      {normalizeCompactToolLabel(result.tool)}
+                    </span>
+                    <span
+                      className={cn(
+                        "rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.1em]",
+                        result.ok
+                          ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-300/80"
+                          : "border-destructive/25 bg-destructive/10 text-destructive/80",
+                      )}
+                    >
+                      {result.ok ? "ok" : "failed"}
+                    </span>
+                    <span className="truncate text-muted-foreground/65" title={result.summary}>
+                      {result.summary}
+                    </span>
+                    {result.artifactId && (
+                      <span className="col-span-3 truncate rounded border border-border/35 bg-background/65 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground/45">
+                        artifact {result.artifactId}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {webSources.length > 0 && (
+            <div className="overflow-hidden rounded-md border border-border/45 bg-background/70">
+              <div className="flex items-center justify-between gap-2 border-b border-border/35 px-2 py-1">
+                <span className="text-[9px] uppercase tracking-[0.14em] text-muted-foreground/45">
+                  web sources
+                </span>
+                <span className="text-[9px] text-muted-foreground/40">{webSources.length}</span>
+              </div>
+              <div className="divide-y divide-border/30">
+                {webSources.map((source, index) => (
+                  <div key={`${workEntry.id}:web:${index}:${source.url}`} className="px-2 py-1.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="truncate text-[11px] leading-4 text-foreground/78">
+                          {source.title ?? source.url}
+                        </p>
+                        <p className="truncate font-mono text-[10px] leading-4 text-muted-foreground/48">
+                          {source.url}
+                        </p>
+                      </div>
+                      {source.status === "failed" && (
+                        <span className="shrink-0 rounded border border-destructive/25 bg-destructive/10 px-1.5 py-0.5 text-[9px] uppercase tracking-[0.1em] text-destructive/80">
+                          failed
+                        </span>
+                      )}
+                    </div>
+                    {(source.publishedDate || source.author) && (
+                      <p className="mt-0.5 truncate text-[10px] leading-4 text-muted-foreground/45">
+                        {[source.publishedDate, source.author].filter(Boolean).join(" - ")}
+                      </p>
+                    )}
+                    {(source.text || source.error) && (
+                      <p className="mt-1 text-[11px] leading-4 text-muted-foreground/68">
+                        {truncateWebSourcePreview(source.error ?? source.text ?? "")}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       {hasChangedFiles && !previewIsChangedFiles && (
         <div className="mt-1 flex flex-wrap gap-1 pl-6">
           {workEntry.changedFiles?.slice(0, 4).map((filePath) => {

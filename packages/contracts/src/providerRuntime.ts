@@ -471,6 +471,7 @@ const TaskProgressPayload = Schema.Struct({
   summary: Schema.optional(TrimmedNonEmptyStringSchema),
   usage: Schema.optional(Schema.Unknown),
   lastToolName: Schema.optional(TrimmedNonEmptyStringSchema),
+  metadata: Schema.optional(UnknownRecordSchema),
 });
 export type TaskProgressPayload = typeof TaskProgressPayload.Type;
 
@@ -479,6 +480,7 @@ const TaskCompletedPayload = Schema.Struct({
   status: Schema.Literals(["completed", "failed", "stopped"]),
   summary: Schema.optional(TrimmedNonEmptyStringSchema),
   usage: Schema.optional(Schema.Unknown),
+  metadata: Schema.optional(UnknownRecordSchema),
 });
 export type TaskCompletedPayload = typeof TaskCompletedPayload.Type;
 

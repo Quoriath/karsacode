@@ -330,14 +330,11 @@ describe("CustomAgent provider", () => {
     const threadId = ThreadId.make("thread-stream-fallback");
     await rt.startSession({ threadId, runtimeMode: "approval-required" });
     await rt.sendTurn({ threadId, input: "hi" });
-    const events = await Effect.runPromise(
-      Stream.fromQueue(rt.events).pipe(Stream.take(6), Stream.runCollect),
+    const fallbackDelta = await takeRuntimeEvent(
+      rt.events,
+      (event) => event.type === "content.delta" && event.payload.delta.includes("fallback ok"),
     );
-    expect(
-      [...events].some(
-        (event) => event.type === "content.delta" && event.payload.delta.includes("fallback ok"),
-      ),
-    ).toBe(true);
+    expect(fallbackDelta.type).toBe("content.delta");
   });
 
   it("emits final answer content while the model JSON response is still streaming", async () => {
@@ -429,7 +426,13 @@ describe("CustomAgent provider", () => {
     const threadId = ThreadId.make("thread-prompt");
     await rt.startSession({ threadId, runtimeMode: "approval-required" });
     await rt.sendTurn({ threadId, input: "hi" });
-    await Effect.runPromise(Stream.fromQueue(rt.events).pipe(Stream.take(6), Stream.runCollect));
+    await takeRuntimeEvent(
+      rt.events,
+      (event) =>
+        event.type === "turn.completed" &&
+        "state" in event.payload &&
+        event.payload.state === "completed",
+    );
     expect(prompt).toContain("Custom Agent protocol");
     expect(prompt).toContain("Do not emit native OpenAI tool_calls");
     expect(prompt).toContain("read_file:");
@@ -444,14 +447,11 @@ describe("CustomAgent provider", () => {
     await rt.startSession({ threadId, runtimeMode: "approval-required" });
     expect(rt.hasSession(threadId)).toBe(true);
     await rt.sendTurn({ threadId, input: "hi" });
-    const events = await Effect.runPromise(
-      Stream.fromQueue(rt.events).pipe(Stream.take(6), Stream.runCollect),
+    const answerDelta = await takeRuntimeEvent(
+      rt.events,
+      (event) => event.type === "content.delta" && event.payload.delta.includes("Hello"),
     );
-    expect(
-      [...events].some(
-        (event) => event.type === "content.delta" && event.payload.delta.includes("Hello"),
-      ),
-    ).toBe(true);
+    expect(answerDelta.type).toBe("content.delta");
     await rt.stopSession(threadId);
     expect(rt.hasSession(threadId)).toBe(false);
   });
@@ -475,16 +475,13 @@ describe("CustomAgent provider", () => {
     const threadId = ThreadId.make("thread-fetch-failed");
     await rt.startSession({ threadId, runtimeMode: "approval-required" });
     await rt.sendTurn({ threadId, input: "hi" });
-    const events = await Effect.runPromise(
-      Stream.fromQueue(rt.events).pipe(Stream.take(6), Stream.runCollect),
+    const errorEvent = await takeRuntimeEvent(
+      rt.events,
+      (event) =>
+        event.type === "runtime.error" &&
+        event.payload.message.includes("Failed to reach Custom Agent API endpoint"),
     );
-    expect(
-      [...events].some(
-        (event) =>
-          event.type === "runtime.error" &&
-          event.payload.message.includes("Failed to reach Custom Agent API endpoint"),
-      ),
-    ).toBe(true);
+    expect(errorEvent.type).toBe("runtime.error");
   });
 
   it("blocks read_file path traversal and summarizes large file reads", async () => {
@@ -623,7 +620,14 @@ describe("CustomAgent provider", () => {
     const threadId = ThreadId.make("thread-tool-role");
     await rt.startSession({ threadId, runtimeMode: "approval-required" });
     await rt.sendTurn({ threadId, input: "read" });
-    await Effect.runPromise(Stream.fromQueue(rt.events).pipe(Stream.take(8), Stream.runCollect));
+    await takeRuntimeEvent(
+      rt.events,
+      (event) =>
+        event.type === "turn.completed" &&
+        "state" in event.payload &&
+        event.payload.state === "completed",
+      1_000,
+    );
     expect(seenRoles.length).toBeGreaterThan(1);
     expect(seenRoles[1]).not.toContain("tool");
     expect(seenRoles[1]?.at(-2)).toBe("user");

@@ -49,6 +49,7 @@ export const makeCustomAgentAdapter = Effect.fn("makeCustomAgentAdapter")(functi
   readonly settings: CustomAgentSettings;
   readonly workspaceRoot: string;
   readonly backend: CustomAgentLlmBackend;
+  readonly environment?: NodeJS.ProcessEnv | undefined;
 }) {
   const events = yield* Queue.unbounded<import("@t3tools/contracts").ProviderRuntimeEvent>();
   const runtime = yield* Effect.tryPromise({

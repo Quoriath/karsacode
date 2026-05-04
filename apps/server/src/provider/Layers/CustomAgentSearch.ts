@@ -8,6 +8,12 @@ import type { CustomAgentSettings } from "@t3tools/contracts";
 import { normalizeCustomAgentPath } from "./CustomAgentSandbox.ts";
 
 const execFileAsync = promisify(execFile);
+const WALK_CACHE_TTL_MS = 10_000;
+const COMMAND_EXISTS_CACHE = new Map<string, boolean>();
+const WALK_CACHE = new Map<
+  string,
+  { readonly createdAt: number; readonly files: ReadonlyArray<string> }
+>();
 const IGNORED_DIRS = new Set([
   ".git",
   ".gradle",
@@ -30,15 +36,23 @@ export interface CustomAgentSearchResult {
 }
 
 async function commandExists(binary: string): Promise<boolean> {
+  const cached = COMMAND_EXISTS_CACHE.get(binary);
+  if (cached !== undefined) return cached;
   try {
     await execFileAsync("/bin/sh", ["-lc", `command -v ${binary}`], { timeout: 1000 });
+    COMMAND_EXISTS_CACHE.set(binary, true);
     return true;
   } catch {
+    COMMAND_EXISTS_CACHE.set(binary, false);
     return false;
   }
 }
 
 async function walk(root: string, max = 5000): Promise<string[]> {
+  const resolvedRoot = path.resolve(root);
+  const cacheKey = `${resolvedRoot}:${max}`;
+  const cached = WALK_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.createdAt <= WALK_CACHE_TTL_MS) return [...cached.files];
   const output: string[] = [];
   async function visit(dir: string): Promise<void> {
     if (output.length >= max) return;
@@ -50,7 +64,8 @@ async function walk(root: string, max = 5000): Promise<string[]> {
       if (output.length >= max) return;
     }
   }
-  await visit(root);
+  await visit(resolvedRoot);
+  WALK_CACHE.set(cacheKey, { createdAt: Date.now(), files: output });
   return output;
 }
 

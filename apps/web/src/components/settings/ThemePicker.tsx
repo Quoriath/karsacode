@@ -1,11 +1,12 @@
 import { CheckIcon, MonitorIcon, MoonIcon, PaletteIcon, SunIcon, XIcon } from "lucide-react";
 import { type ReactNode, useState, useEffect } from "react";
 
+import type { Theme } from "../../hooks/useTheme";
 import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
 
 export interface ThemeOption {
-  readonly value: string;
+  readonly value: Theme;
   readonly label: string;
   readonly icon: ReactNode;
   readonly description?: string;
@@ -415,8 +416,8 @@ export function ThemePicker({
   value,
   onChange,
 }: {
-  value: string;
-  onChange: (value: string) => void;
+  value: Theme;
+  onChange: (value: Theme) => void;
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<"basic" | "custom">("basic");
@@ -456,7 +457,7 @@ export function ThemePicker({
     requestAnimationFrame(() => setAnimating(false));
   };
 
-  const handleSelect = (newValue: string) => {
+  const handleSelect = (newValue: Theme) => {
     onChange(newValue);
     setIsOpen(false);
   };

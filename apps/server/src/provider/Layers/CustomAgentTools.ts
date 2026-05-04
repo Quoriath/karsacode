@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -33,6 +33,7 @@ import {
 import { semanticSearchCustomAgent } from "./CustomAgentSemanticSearch.ts";
 import { makeCustomAgentMcp } from "./CustomAgentMcp.ts";
 import { makeCustomAgentSkillRegistry, formatSkillListForPrompt } from "./CustomAgentSkills.ts";
+import { customAgentWebFetch, customAgentWebSearch } from "./CustomAgentWeb.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -40,12 +41,22 @@ export type CustomAgentToolName =
   | "read_file"
   | "write_file"
   | "edit_file"
+  | "delete_file"
   | "apply_patch"
   | "run_command"
-  | "tool_batch"
+  | "todo_write"
+  | "todo_read"
+  | "subagent_spawn"
+  | "subagent_status"
+  | "subagent_wait"
+  | "code_navigation"
+  | "project_map"
+  | "file_outline"
   | "search_repo"
   | "find_files"
   | "semantic_search"
+  | "web_search"
+  | "web_fetch"
   | "list_files"
   | "project_context"
   | "git_status"
@@ -55,6 +66,7 @@ export type CustomAgentToolName =
   | "rollback_checkpoint"
   | "list_checkpoints"
   | "retrieve_artifact"
+  | "search_artifacts"
   | "summarize_artifact"
   | "mcp_list_servers"
   | "mcp_list_tools"
@@ -94,6 +106,7 @@ export interface CustomAgentToolCallContext {
   readonly toolCallId: string;
   readonly runtimeMode: "approval-required" | "auto-accept-edits" | "full-access";
   readonly sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
+  readonly signal?: AbortSignal | undefined;
   readonly requestApproval: (
     request: CustomAgentApprovalRequest,
   ) => Promise<ProviderApprovalDecision>;
@@ -132,6 +145,13 @@ function boolArg(args: Record<string, unknown>, key: string): boolean | undefine
   return typeof value === "boolean" ? value : undefined;
 }
 
+function stringArrayArg(args: Record<string, unknown>, key: string): ReadonlyArray<string> {
+  const value = args[key];
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) return value;
+  throw new Error(`Missing string array argument: ${key}`);
+}
+
 function rel(workspaceRoot: string, file: string): string {
   return path.relative(workspaceRoot, file) || ".";
 }
@@ -140,6 +160,130 @@ async function readText(file: string): Promise<string> {
   const buffer = await readFile(file);
   if (buffer.subarray(0, 8000).includes(0)) throw new Error("Binary file refused.");
   return buffer.toString("utf8");
+}
+
+function compactLimit(value: number | undefined, fallback: number, max: number): number {
+  return Math.max(1, Math.min(max, Math.floor(value ?? fallback)));
+}
+
+function outlineTextFile(relativePath: string, content: string, maxSymbols: number) {
+  const lines = content.split(/\r?\n/);
+  const imports: Array<{ line: number; text: string }> = [];
+  const exports: Array<{ line: number; text: string }> = [];
+  const symbols: Array<{ kind: string; name: string; line: number; signature: string }> = [];
+  const symbolPatterns: ReadonlyArray<{
+    kind: string;
+    pattern: RegExp;
+    nameIndex?: number;
+  }> = [
+    { kind: "function", pattern: /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/ },
+    { kind: "class", pattern: /^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)/ },
+    { kind: "interface", pattern: /^\s*(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)/ },
+    { kind: "type", pattern: /^\s*(?:export\s+)?type\s+([A-Za-z_$][\w$]*)/ },
+    { kind: "enum", pattern: /^\s*(?:export\s+)?enum\s+([A-Za-z_$][\w$]*)/ },
+    { kind: "const", pattern: /^\s*(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=/ },
+    { kind: "rust_fn", pattern: /^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/ },
+    { kind: "rust_type", pattern: /^\s*(?:pub\s+)?(?:struct|enum|trait|impl)\s+([A-Za-z_]\w*)/ },
+    { kind: "python_def", pattern: /^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)/ },
+    { kind: "python_class", pattern: /^\s*class\s+([A-Za-z_]\w*)/ },
+    { kind: "dart_type", pattern: /^\s*(?:class|enum|mixin|extension)\s+([A-Za-z_]\w*)/ },
+    {
+      kind: "kotlin_fun",
+      pattern:
+        /^\s*(?:(?:public|private|protected|internal)\s+)?(?:suspend\s+)?fun\s+([A-Za-z_]\w*)/,
+    },
+  ];
+
+  for (const [index, rawLine] of lines.entries()) {
+    const line = index + 1;
+    const text = rawLine.trim();
+    if (!text) continue;
+    if (
+      imports.length < 40 &&
+      /^(import\b|from\s+\S+\s+import\b|use\s+|require\(|const\s+\{.*\}\s*=\s*require\()/.test(text)
+    )
+      imports.push({ line, text: text.slice(0, 220) });
+    if (exports.length < 40 && /^(export\b|module\.exports\b)/.test(text))
+      exports.push({ line, text: text.slice(0, 220) });
+    if (symbols.length >= maxSymbols) continue;
+    for (const entry of symbolPatterns) {
+      const match = rawLine.match(entry.pattern);
+      const name = match?.[entry.nameIndex ?? 1];
+      if (!name) continue;
+      symbols.push({
+        kind: entry.kind,
+        name,
+        line,
+        signature: text.slice(0, 220),
+      });
+      break;
+    }
+  }
+
+  return {
+    path: relativePath,
+    totalLines: lines.length,
+    imports,
+    exports,
+    symbols,
+    suggestedReads: symbols.slice(0, 24).map((symbol) => ({
+      path: relativePath,
+      symbol: symbol.name,
+      startLine: Math.max(1, symbol.line - 3),
+      endLine: Math.min(lines.length, symbol.line + 24),
+    })),
+  };
+}
+
+type FileOutline = ReturnType<typeof outlineTextFile>;
+
+const FILE_OUTLINE_CACHE = new Map<
+  string,
+  {
+    readonly size: number;
+    readonly mtimeMs: number;
+    readonly maxSymbols: number;
+    readonly outline: FileOutline;
+  }
+>();
+
+async function outlineFileCached(input: {
+  readonly settings: CustomAgentSettings;
+  readonly workspaceRoot: string;
+  readonly relativePath: string;
+  readonly maxSymbols: number;
+}): Promise<FileOutline> {
+  const absolute = normalizeCustomAgentPath(
+    input.settings,
+    input.workspaceRoot,
+    input.relativePath,
+  );
+  const info = await stat(absolute);
+  const key = `${input.workspaceRoot}:${input.relativePath}`;
+  const cached = FILE_OUTLINE_CACHE.get(key);
+  if (
+    cached &&
+    cached.size === info.size &&
+    cached.mtimeMs === info.mtimeMs &&
+    cached.maxSymbols >= input.maxSymbols
+  ) {
+    return {
+      ...cached.outline,
+      imports: cached.outline.imports,
+      exports: cached.outline.exports,
+      symbols: cached.outline.symbols.slice(0, input.maxSymbols),
+      suggestedReads: cached.outline.suggestedReads,
+    };
+  }
+  const content = await readText(absolute);
+  const outline = outlineTextFile(input.relativePath, content, input.maxSymbols);
+  FILE_OUTLINE_CACHE.set(key, {
+    size: info.size,
+    mtimeMs: info.mtimeMs,
+    maxSymbols: input.maxSymbols,
+    outline,
+  });
+  return outline;
 }
 
 async function diffFile(
@@ -232,6 +376,7 @@ export function makeCustomAgentToolRegistry(input: {
   readonly workspaceRoot: string;
   readonly contextStore: CustomAgentContextStore;
   readonly checkpointStore?: CustomAgentCheckpointStore;
+  readonly environment?: NodeJS.ProcessEnv | undefined;
 }): CustomAgentToolRegistry {
   const checkpointStore = input.checkpointStore ?? makeCustomAgentCheckpointStore();
   const mcp = makeCustomAgentMcp(input.settings);
@@ -240,12 +385,22 @@ export function makeCustomAgentToolRegistry(input: {
     "read_file",
     "write_file",
     "edit_file",
+    "delete_file",
     "apply_patch",
     "run_command",
-    "tool_batch",
+    "todo_write",
+    "todo_read",
+    "subagent_spawn",
+    "subagent_status",
+    "subagent_wait",
+    "code_navigation",
+    "project_map",
+    "file_outline",
     "search_repo",
     "find_files",
     "semantic_search",
+    "web_search",
+    "web_fetch",
     "list_files",
     "project_context",
     "git_status",
@@ -255,6 +410,7 @@ export function makeCustomAgentToolRegistry(input: {
     "rollback_checkpoint",
     "list_checkpoints",
     "retrieve_artifact",
+    "search_artifacts",
     "summarize_artifact",
     "mcp_list_servers",
     "mcp_list_tools",
@@ -272,6 +428,18 @@ export function makeCustomAgentToolRegistry(input: {
       return { ok: false, content: `Unknown tool: ${nameRaw}` };
     const name = nameRaw as CustomAgentToolName;
     const purpose = stringArg(args, "purpose", "tool call");
+    if (
+      name === "subagent_spawn" ||
+      name === "subagent_status" ||
+      name === "subagent_wait" ||
+      name === "todo_write" ||
+      name === "todo_read"
+    ) {
+      return {
+        ok: false,
+        content: "This orchestration tool is handled by the CustomAgent runtime.",
+      };
+    }
     if (name === "read_file") {
       const file = normalizeCustomAgentPath(
         input.settings,
@@ -336,6 +504,256 @@ export function makeCustomAgentToolRegistry(input: {
         }),
         artifactId: artifact.id,
         data: { path: relative, startLine: start, endLine: end },
+      };
+    }
+    if (name === "code_navigation") {
+      const query = stringArg(args, "query");
+      const maxFiles = compactLimit(numberArg(args, "maxFiles"), 8, 20);
+      const maxSymbols = compactLimit(numberArg(args, "maxSymbols"), 30, 80);
+      const pathScope = typeof args.path === "string" ? args.path : undefined;
+      const glob = typeof args.glob === "string" ? args.glob : undefined;
+      const extension = typeof args.extension === "string" ? args.extension : undefined;
+      const found = await findCustomAgentFiles({
+        settings: input.settings,
+        workspaceRoot: input.workspaceRoot,
+        query,
+        ...(extension ? { extension } : {}),
+        ...(pathScope ? { path: pathScope } : {}),
+        maxResults: Math.max(maxFiles * 3, 20),
+      });
+      const searched = await searchCustomAgentRepo({
+        settings: input.settings,
+        workspaceRoot: input.workspaceRoot,
+        query,
+        ...(pathScope ? { path: pathScope } : {}),
+        ...(glob ? { glob } : {}),
+        maxResults: Math.max(maxFiles * 4, 20),
+        contextLines: 1,
+      });
+      const ranked = new Map<string, number>();
+      for (const file of found.files) ranked.set(file, (ranked.get(file) ?? 0) + 2);
+      for (const file of searched.topFiles) ranked.set(file, (ranked.get(file) ?? 0) + 5);
+      for (const snippet of searched.snippets)
+        ranked.set(snippet.path, (ranked.get(snippet.path) ?? 0) + 1);
+      const candidates = [...ranked.entries()]
+        .toSorted((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+        .slice(0, maxFiles)
+        .map(([file, score]) => ({ file, score }));
+      const outlines = [];
+      for (const candidate of candidates) {
+        const sensitive = /(^|\/)(\.env|\.ssh|id_rsa|secrets?|credentials?)(\/|$)/i.test(
+          candidate.file,
+        );
+        if (sensitive) continue;
+        const outline = await outlineFileCached({
+          settings: input.settings,
+          workspaceRoot: input.workspaceRoot,
+          relativePath: candidate.file,
+          maxSymbols,
+        }).catch(() => undefined);
+        if (outline === undefined) continue;
+        outlines.push({
+          path: candidate.file,
+          score: candidate.score,
+          totalLines: outline.totalLines,
+          symbols: outline.symbols.slice(0, maxSymbols),
+          suggestedReads: outline.suggestedReads.slice(0, 8),
+        });
+      }
+      const result = {
+        query,
+        fileMatches: {
+          totalMatches: found.totalMatches,
+          files: found.files.slice(0, Math.max(maxFiles, 10)),
+        },
+        lexicalMatches: {
+          totalMatches: searched.totalMatches,
+          topFiles: searched.topFiles,
+          snippets: searched.snippets.slice(0, 12),
+          suggestedReads: searched.suggestedReads.slice(0, 12),
+        },
+        outlines,
+      };
+      const artifact = input.contextStore.storeArtifact({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        toolCallId: context.toolCallId,
+        kind: "code.navigation",
+        content: JSON.stringify(result, null, 2),
+        summary: `code_navigation ${query}: ${candidates.length} candidate files, ${searched.totalMatches} lexical matches`,
+        preview: outlines
+          .map(
+            (outline) =>
+              `${outline.path}: ${outline.symbols
+                .slice(0, 10)
+                .map((symbol) => `${symbol.name}@${symbol.line}`)
+                .join(", ")}`,
+          )
+          .join("\n"),
+        sensitive: false,
+        truncated:
+          found.totalMatches > found.files.length ||
+          searched.totalMatches > searched.snippets.length,
+        metadata: { query, path: pathScope, glob, extension },
+      });
+      return {
+        ok: true,
+        content: JSON.stringify({
+          ...result,
+          artifactId: artifact.id,
+        }),
+        artifactId: artifact.id,
+        data: {
+          query,
+          candidates: candidates.length,
+          lexicalMatches: searched.totalMatches,
+          artifactId: artifact.id,
+        },
+      };
+    }
+    if (name === "project_map") {
+      const maxFiles = compactLimit(numberArg(args, "maxFiles"), 160, 500);
+      const contextResult = await getCustomAgentProjectContext({
+        settings: input.settings,
+        workspaceRoot: input.workspaceRoot,
+        maxFiles: Math.max(maxFiles, 500),
+      });
+      const listed = await listCustomAgentFiles({
+        settings: input.settings,
+        workspaceRoot: input.workspaceRoot,
+        maxResults: maxFiles,
+      });
+      const keyQueries = [
+        "README",
+        "package.json",
+        "tsconfig",
+        "vite.config",
+        "turbo",
+        "src/index",
+        "src/main",
+        "src/bin",
+        "app",
+        "router",
+      ];
+      const keyResults = await Promise.all(
+        keyQueries.map((query) =>
+          findCustomAgentFiles({
+            settings: input.settings,
+            workspaceRoot: input.workspaceRoot,
+            query,
+            maxResults: 8,
+          }),
+        ),
+      );
+      const keyFiles = [...new Set(keyResults.flatMap((result) => result.files))].slice(0, 40);
+      const folderHints = contextResult.topLevelDirs.slice(0, 16).map((entry) => ({
+        folder: entry.name,
+        files: entry.count,
+      }));
+      const result = {
+        workspaceRoot: contextResult.workspaceRoot,
+        projectName: contextResult.projectName,
+        totalFiles: contextResult.totalFiles,
+        truncated: contextResult.truncated,
+        stackSignals: contextResult.projectSignals,
+        packageManagers: contextResult.packageManagers,
+        extensions: contextResult.extensions.slice(0, 16),
+        folders: folderHints,
+        keyFiles,
+        suggestedNextTools: [
+          "code_navigation for feature/concept lookup",
+          "file_outline for large candidate files",
+          "read_file with line ranges for exact evidence",
+        ],
+      };
+      const artifact = input.contextStore.storeArtifact({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        toolCallId: context.toolCallId,
+        kind: "project.map",
+        content: JSON.stringify({ ...result, sampledFiles: listed.files }, null, 2),
+        summary: `${contextResult.projectName}: ${contextResult.totalFiles} files, ${contextResult.projectSignals.join(", ") || "unknown stack"}`,
+        preview: [
+          contextResult.summary,
+          `Folders: ${folderHints.map((folder) => `${folder.folder}:${folder.files}`).join(", ")}`,
+          `Key files: ${keyFiles.slice(0, 20).join(", ")}`,
+        ].join("\n"),
+        sensitive: false,
+        truncated: listed.files.length >= maxFiles,
+        metadata: { maxFiles },
+      });
+      return {
+        ok: true,
+        content: JSON.stringify({ ...result, artifactId: artifact.id }),
+        artifactId: artifact.id,
+        data: {
+          projectName: result.projectName,
+          totalFiles: result.totalFiles,
+          keyFiles: result.keyFiles.length,
+          artifactId: artifact.id,
+        },
+      };
+    }
+    if (name === "file_outline") {
+      const file = normalizeCustomAgentPath(
+        input.settings,
+        input.workspaceRoot,
+        stringArg(args, "path"),
+      );
+      const relative = rel(input.workspaceRoot, file);
+      const sensitive = /(^|\/)(\.env|\.ssh|id_rsa|secrets?|credentials?)(\/|$)/i.test(relative);
+      await maybeApprove({
+        settings: input.settings,
+        context,
+        name,
+        risk: sensitive ? "sensitive" : "low",
+        requestType: "file_read_approval",
+        purpose,
+        args,
+        affectedFiles: [relative],
+      });
+      const outlineMaxSymbols = compactLimit(numberArg(args, "maxSymbols"), 80, 200);
+      const outline = await outlineFileCached({
+        settings: input.settings,
+        workspaceRoot: input.workspaceRoot,
+        relativePath: relative,
+        maxSymbols: outlineMaxSymbols,
+      });
+      const artifactContent = JSON.stringify(outline, null, 2);
+      const artifact = input.contextStore.storeArtifact({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        toolCallId: context.toolCallId,
+        kind: "file.outline",
+        path: relative,
+        content: artifactContent,
+        summary: `${relative}: ${outline.symbols.length} symbols, ${outline.imports.length} imports, ${outline.totalLines} lines`,
+        preview: outline.symbols
+          .slice(0, 40)
+          .map((symbol) => `${symbol.line}:${symbol.kind}:${symbol.name}`)
+          .join("\n"),
+        sensitive,
+        truncated: outline.symbols.length >= outlineMaxSymbols,
+        metadata: { totalLines: outline.totalLines },
+      });
+      return {
+        ok: true,
+        content: JSON.stringify({
+          path: relative,
+          totalLines: outline.totalLines,
+          imports: outline.imports.slice(0, 20),
+          exports: outline.exports.slice(0, 20),
+          symbols: outline.symbols.slice(0, 80),
+          suggestedReads: outline.suggestedReads,
+          artifactId: artifact.id,
+        }),
+        artifactId: artifact.id,
+        data: {
+          path: relative,
+          totalLines: outline.totalLines,
+          symbols: outline.symbols.length,
+          artifactId: artifact.id,
+        },
       };
     }
     if (name === "list_files") {
@@ -470,7 +888,118 @@ export function makeCustomAgentToolRegistry(input: {
       if (typeof args.glob === "string") semanticInput.glob = args.glob;
       const maxResults = numberArg(args, "maxResults");
       if (maxResults !== undefined) semanticInput.maxResults = maxResults;
-      return { ok: true, content: JSON.stringify(await semanticSearchCustomAgent(semanticInput)) };
+      const result = await semanticSearchCustomAgent(semanticInput);
+      const artifact = input.contextStore.storeArtifact({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        toolCallId: context.toolCallId,
+        kind: "search.semantic",
+        content: JSON.stringify(result, null, 2),
+        summary: `${result.results.length} semantic results for ${semanticInput.query}`,
+        preview: result.results
+          .slice(0, 20)
+          .map((entry) => {
+            const item = entry as {
+              path?: string;
+              line?: number;
+              summary?: string;
+              text?: string;
+            };
+            return `${item.path ?? "unknown"}:${item.line ?? 0}: ${item.summary ?? item.text ?? ""}`;
+          })
+          .join("\n"),
+        sensitive: false,
+        truncated: false,
+        metadata: { query: semanticInput.query },
+      });
+      return {
+        ok: true,
+        content: JSON.stringify({
+          enabled: result.enabled,
+          message: result.message,
+          results: result.results.slice(0, 20),
+          artifactId: artifact.id,
+        }),
+        artifactId: artifact.id,
+      };
+    }
+    if (name === "web_search") {
+      const result = await customAgentWebSearch({
+        query: stringArg(args, "query"),
+        maxResults: numberArg(args, "maxResults"),
+        includeText: boolArg(args, "includeText"),
+        maxTextCharacters: numberArg(args, "maxTextCharacters"),
+        timeoutMs: numberArg(args, "timeoutMs"),
+        signal: context.signal,
+        environment: input.environment,
+      });
+      const artifact = input.contextStore.storeArtifact({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        toolCallId: context.toolCallId,
+        kind: "web.search",
+        content: JSON.stringify(result, null, 2),
+        summary: `Exa search: ${result.resultCount} results for ${result.query}`,
+        preview: result.results
+          .map((entry, index) => `${index + 1}. ${entry.title ?? entry.url} - ${entry.url}`)
+          .join("\n"),
+        sensitive: false,
+        truncated: result.truncated,
+        metadata: { provider: "exa", query: result.query },
+      });
+      return {
+        ok: true,
+        content: JSON.stringify({ ...result, artifactId: artifact.id }),
+        artifactId: artifact.id,
+        data: {
+          kind: "web_search",
+          provider: "exa",
+          query: result.query,
+          results: result.results,
+          resultCount: result.resultCount,
+          truncated: result.truncated,
+          artifactId: artifact.id,
+        },
+      };
+    }
+    if (name === "web_fetch") {
+      const urls = "urls" in args ? stringArrayArg(args, "urls") : stringArrayArg(args, "url");
+      const result = await customAgentWebFetch({
+        urls,
+        maxTextCharacters: numberArg(args, "maxTextCharacters"),
+        timeoutMs: numberArg(args, "timeoutMs"),
+        signal: context.signal,
+        environment: input.environment,
+      });
+      const artifact = input.contextStore.storeArtifact({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        toolCallId: context.toolCallId,
+        kind: "web.fetch",
+        content: JSON.stringify(result, null, 2),
+        summary: `Exa fetch: ${result.pageCount}/${result.requestedUrls.length} pages extracted`,
+        preview: result.pages
+          .map((entry, index) => `${index + 1}. ${entry.title ?? entry.url} - ${entry.url}`)
+          .join("\n"),
+        sensitive: false,
+        truncated: result.truncated,
+        metadata: { provider: "exa", urls: result.requestedUrls },
+      });
+      return {
+        ok: result.pageCount > 0,
+        content: JSON.stringify({ ...result, artifactId: artifact.id }),
+        artifactId: artifact.id,
+        data: {
+          kind: "web_fetch",
+          provider: "exa",
+          requestedUrls: result.requestedUrls,
+          pages: result.pages,
+          failures: result.failures,
+          pageCount: result.pageCount,
+          truncated: result.truncated,
+          artifactId: artifact.id,
+        },
+      };
     }
     if (name === "write_file" || name === "edit_file") {
       if (context.sandboxMode === "read-only") throw new Error("Sandbox is read-only.");
@@ -543,6 +1072,58 @@ export function makeCustomAgentToolRegistry(input: {
           path: relative,
           beforeHash: customAgentHash(before),
           afterHash: customAgentHash(after),
+          checkpointId: checkpoint.id,
+          diffSummary: diff.slice(0, 2000),
+        }),
+        checkpointId: checkpoint.id,
+        diff,
+      };
+    }
+    if (name === "delete_file") {
+      if (context.sandboxMode === "read-only") throw new Error("Sandbox is read-only.");
+      const file = normalizeCustomAgentPath(
+        input.settings,
+        input.workspaceRoot,
+        stringArg(args, "path"),
+      );
+      const relative = rel(input.workspaceRoot, file);
+      if (!existsSync(file)) throw new Error(`File does not exist: ${relative}`);
+      const fileStat = await stat(file);
+      if (!fileStat.isFile()) throw new Error(`delete_file can only remove files: ${relative}`);
+      const before = await readText(file);
+      if (typeof args.expectedHash === "string" && customAgentHash(before) !== args.expectedHash)
+        throw new Error("expectedHash does not match current file content.");
+      const diff = await diffFile(input.workspaceRoot, relative, before, "");
+      const checkpoint = await checkpointStore.createCheckpoint({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        purpose,
+        files: [relative],
+        workspaceRoot: input.workspaceRoot,
+        toolCallId: context.toolCallId,
+        unifiedDiff: diff,
+      });
+      await maybeApprove({
+        settings: input.settings,
+        context,
+        name,
+        risk: "mutation",
+        requestType: "file_change_approval",
+        purpose,
+        args,
+        affectedFiles: [relative],
+        detail: diff.slice(0, input.settings.maxToolPreviewBytes),
+      });
+      await unlink(file);
+      await checkpointStore.finalizeCheckpoint(checkpoint.id, input.workspaceRoot);
+      input.contextStore.recordFileTouch({ threadId: context.threadId, path: relative });
+      context.emitDiff?.(diff);
+      return {
+        ok: true,
+        content: JSON.stringify({
+          path: relative,
+          deleted: true,
+          beforeHash: customAgentHash(before),
           checkpointId: checkpoint.id,
           diffSummary: diff.slice(0, 2000),
         }),
@@ -632,6 +1213,7 @@ export function makeCustomAgentToolRegistry(input: {
         cwd: typeof args.cwd === "string" ? args.cwd : undefined,
         timeoutMs: numberArg(args, "timeoutMs"),
         maxOutputBytes: numberArg(args, "maxOutputBytes"),
+        signal: context.signal,
         env:
           typeof args.env === "object" && args.env && !Array.isArray(args.env)
             ? (args.env as Record<string, string>)
@@ -643,54 +1225,6 @@ export function makeCustomAgentToolRegistry(input: {
         exitCode: result.exitCode,
       });
       return { ok: true, content: JSON.stringify(result), data: result };
-    }
-    if (name === "tool_batch") {
-      const calls = Array.isArray(args.calls)
-        ? args.calls.filter((call): call is Record<string, unknown> => {
-            return typeof call === "object" && call !== null && !Array.isArray(call);
-          })
-        : [];
-      const allowedBatchTools = new Set<CustomAgentToolName>([
-        "project_context",
-        "find_files",
-        "list_files",
-        "search_repo",
-        "semantic_search",
-        "read_file",
-        "git_status",
-        "git_diff",
-        "working_tree_summary",
-        "summarize_artifact",
-      ]);
-      if (calls.length === 0) return { ok: false, content: "tool_batch needs non-empty calls." };
-      const results: Array<{ tool: string; ok: boolean; content: string; artifactId?: string }> =
-        [];
-      for (const [index, call] of calls.slice(0, 6).entries()) {
-        const tool = typeof call.tool === "string" ? call.tool : "";
-        const callArgs =
-          typeof call.args === "object" && call.args !== null && !Array.isArray(call.args)
-            ? (call.args as Record<string, unknown>)
-            : {};
-        if (!allowedBatchTools.has(tool as CustomAgentToolName)) {
-          results.push({ tool, ok: false, content: "Tool is not allowed in read-only batch." });
-          continue;
-        }
-        const childResult = await execute(
-          tool,
-          { ...callArgs, purpose: String(callArgs.purpose ?? `batch step ${index + 1}`) },
-          { ...context, toolCallId: `${context.toolCallId}_${index + 1}` },
-        );
-        results.push({
-          tool,
-          ok: childResult.ok,
-          content: childResult.content.slice(0, input.settings.maxToolPreviewBytes),
-          ...(childResult.artifactId ? { artifactId: childResult.artifactId } : {}),
-        });
-      }
-      return {
-        ok: results.every((result) => result.ok),
-        content: JSON.stringify({ results, truncatedToCalls: Math.min(calls.length, 6) }),
-      };
     }
     if (name === "git_status" || name === "git_diff" || name === "working_tree_summary") {
       const command =
@@ -708,6 +1242,7 @@ export function makeCustomAgentToolRegistry(input: {
         workspaceRoot: input.workspaceRoot,
         command,
         timeoutMs: 10000,
+        signal: context.signal,
       });
       return { ok: true, content: JSON.stringify(result), data: result };
     }
@@ -763,6 +1298,30 @@ export function makeCustomAgentToolRegistry(input: {
             }),
           }
         : { ok: false, content: "Artifact not found." };
+    }
+    if (name === "search_artifacts") {
+      const kind = typeof args.kind === "string" ? args.kind : undefined;
+      const artifacts = input.contextStore.searchArtifacts(stringArg(args, "query"), {
+        threadId: context.threadId,
+        ...(kind ? { kind } : {}),
+      });
+      return {
+        ok: true,
+        content: JSON.stringify({
+          totalMatches: artifacts.length,
+          artifacts: artifacts.map((artifact) => ({
+            artifactId: artifact.id,
+            kind: artifact.kind,
+            path: artifact.path,
+            command: artifact.command,
+            summary: artifact.summary,
+            preview: artifact.preview.slice(0, 500),
+            tokensEstimate: artifact.tokensEstimate,
+            truncated: artifact.truncated,
+            createdAt: artifact.createdAt,
+          })),
+        }),
+      };
     }
     if (name === "summarize_artifact")
       return {

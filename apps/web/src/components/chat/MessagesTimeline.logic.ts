@@ -35,7 +35,12 @@ export type MessagesTimelineRow =
       createdAt: string;
       proposedPlan: ProposedPlan;
     }
-  | { kind: "working"; id: string; createdAt: string | null };
+  | {
+      kind: "working";
+      id: string;
+      createdAt: string | null;
+      activeWorkEntry?: WorkLogEntry | undefined;
+    };
 
 export interface StableMessagesTimelineRowsState {
   byId: Map<string, MessagesTimelineRow>;
@@ -185,6 +190,7 @@ export function deriveMessagesTimelineRows(input: {
       kind: "working",
       id: "working-indicator-row",
       createdAt: input.activeTurnStartedAt,
+      activeWorkEntry: deriveActiveWorkEntry(input.timelineEntries),
     });
   }
 
@@ -217,7 +223,10 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
   switch (a.kind) {
     case "working":
-      return a.createdAt === (b as typeof a).createdAt;
+      return (
+        a.createdAt === (b as typeof a).createdAt &&
+        a.activeWorkEntry === (b as typeof a).activeWorkEntry
+      );
 
     case "proposed-plan":
       return a.proposedPlan === (b as typeof a).proposedPlan;
@@ -237,4 +246,19 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
       );
     }
   }
+}
+
+function deriveActiveWorkEntry(
+  timelineEntries: ReadonlyArray<TimelineEntry>,
+): WorkLogEntry | undefined {
+  for (let index = timelineEntries.length - 1; index >= 0; index -= 1) {
+    const timelineEntry = timelineEntries[index];
+    if (timelineEntry?.kind !== "work") {
+      continue;
+    }
+    if (timelineEntry.entry.status === "inProgress") {
+      return timelineEntry.entry;
+    }
+  }
+  return undefined;
 }
