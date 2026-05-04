@@ -155,6 +155,19 @@ export function readProviderConfigStringRecordInput(config: unknown, key: string
   return Object.keys(record).length === 0 ? "" : JSON.stringify(record, null, 2);
 }
 
+export function readProviderConfigNumberRecordInput(config: unknown, key: string): string {
+  if (config === null || typeof config !== "object") return "";
+  const value = (config as Record<string, unknown>)[key];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return "";
+  const record = Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, number] =>
+        typeof entry[1] === "number" && Number.isFinite(entry[1]),
+    ),
+  );
+  return Object.keys(record).length === 0 ? "" : JSON.stringify(record, null, 2);
+}
+
 export function nextProviderConfigWithFieldValue(
   config: unknown,
   field: ProviderSettingsFieldModel,
@@ -223,7 +236,7 @@ function FieldFrame(props: {
   readonly children: ReactNode;
 }) {
   if (props.variant === "card") {
-    return <div className="border-t border-border/60 px-4 py-3 sm:px-5">{props.children}</div>;
+    return <div className="border-t border-border/60 px-3.5 py-2.5 sm:px-4">{props.children}</div>;
   }
   return <div className="grid gap-1.5">{props.children}</div>;
 }
@@ -387,6 +400,39 @@ function ProviderSettingsFieldRow({
   }
 
   if (field.control === "textarea") {
+    // Check if this is a JSON record field (for modelContextWindows)
+    const isJsonRecord = field.key === "modelContextWindows";
+    const currentValue = isJsonRecord
+      ? readProviderConfigNumberRecordInput(value, field.key)
+      : readProviderConfigString(value, field.key);
+
+    const handleChange = (next: string) => {
+      if (isJsonRecord) {
+        const raw = next.trim();
+        if (raw.length === 0) {
+          onChange(nextProviderConfigWithFieldValue(value, field, {}));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+            const record = Object.fromEntries(
+              Object.entries(parsed).filter(
+                (entry): entry is [string, number] =>
+                  typeof entry[1] === "number" && Number.isFinite(entry[1]),
+              ),
+            );
+            onChange(nextProviderConfigWithFieldValue(value, field, record));
+          }
+        } catch {
+          // Invalid JSON, don't update
+          return;
+        }
+      } else {
+        onChange(nextProviderConfigWithFieldValue(value, field, next));
+      }
+    };
+
     return (
       <FieldFrame variant={variant}>
         <label htmlFor={inputId} className={cn(variant === "card" && "block")}>
@@ -394,10 +440,8 @@ function ProviderSettingsFieldRow({
           <Textarea
             id={inputId}
             className={cn(variant === "card" && "mt-1.5")}
-            value={readProviderConfigString(value, field.key)}
-            onChange={(event) =>
-              onChange(nextProviderConfigWithFieldValue(value, field, event.target.value))
-            }
+            value={currentValue}
+            onChange={(event) => handleChange(event.target.value)}
             placeholder={field.placeholder}
             spellCheck={false}
           />

@@ -1,6 +1,25 @@
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 
-type Theme = "light" | "dark" | "system";
+type Theme =
+  | "system"
+  | "light"
+  | "dark"
+  | "github-dark"
+  | "github-light"
+  | "nord"
+  | "dracula"
+  | "catppuccin-mocha"
+  | "catppuccin-latte"
+  | "vscode-dark"
+  | "vscode-light"
+  | "gruvbox-dark"
+  | "gruvbox-light"
+  | "monokai"
+  | "solarized-dark"
+  | "solarized-light"
+  | "tokyo-night"
+  | "rose-pine"
+  | "one-dark";
 type ThemeSnapshot = {
   theme: Theme;
   systemDark: boolean;
@@ -34,7 +53,28 @@ function getSystemDark() {
 function getStored(): Theme {
   if (!hasThemeStorage()) return DEFAULT_THEME_SNAPSHOT.theme;
   const raw = localStorage.getItem(STORAGE_KEY);
-  if (raw === "light" || raw === "dark" || raw === "system") return raw;
+  if (
+    raw === "system" ||
+    raw === "light" ||
+    raw === "dark" ||
+    raw === "github-dark" ||
+    raw === "github-light" ||
+    raw === "nord" ||
+    raw === "dracula" ||
+    raw === "catppuccin-mocha" ||
+    raw === "catppuccin-latte" ||
+    raw === "vscode-dark" ||
+    raw === "vscode-light" ||
+    raw === "gruvbox-dark" ||
+    raw === "gruvbox-light" ||
+    raw === "monokai" ||
+    raw === "solarized-dark" ||
+    raw === "solarized-light" ||
+    raw === "tokyo-night" ||
+    raw === "rose-pine" ||
+    raw === "one-dark"
+  )
+    return raw;
   return DEFAULT_THEME_SNAPSHOT.theme;
 }
 
@@ -87,13 +127,48 @@ export function syncBrowserChromeTheme() {
   ensureThemeColorMetaTag().setAttribute("content", backgroundColor);
 }
 
+function applyCustomTheme(theme: Theme) {
+  if (typeof document === "undefined") return;
+
+  // Set data-theme attribute for custom themes, remove for basic themes
+  if (theme === "system" || theme === "light" || theme === "dark") {
+    document.documentElement.removeAttribute("data-theme");
+  } else {
+    document.documentElement.setAttribute("data-theme", theme);
+  }
+}
+
 function applyTheme(theme: Theme, suppressTransitions = false) {
   if (typeof document === "undefined" || typeof window === "undefined") return;
   if (suppressTransitions) {
     document.documentElement.classList.add("no-transitions");
   }
-  const isDark = theme === "dark" || (theme === "system" && getSystemDark());
+
+  // Determine if dark mode should be active
+  let isDark: boolean;
+  if (theme === "system") {
+    isDark = getSystemDark();
+  } else if (theme === "dark") {
+    isDark = true;
+  } else if (theme === "light") {
+    isDark = false;
+  } else {
+    // Custom themes: determine from the theme name
+    const lightThemes = [
+      "github-light",
+      "catppuccin-latte",
+      "vscode-light",
+      "gruvbox-light",
+      "solarized-light",
+    ];
+    isDark = !lightThemes.includes(theme);
+  }
+
   document.documentElement.classList.toggle("dark", isDark);
+
+  // Apply custom theme CSS variables
+  applyCustomTheme(theme);
+
   syncBrowserChromeTheme();
   syncDesktopTheme(theme);
   if (suppressTransitions) {
@@ -176,7 +251,18 @@ export function useTheme() {
   const theme = snapshot.theme;
 
   const resolvedTheme: "light" | "dark" =
-    theme === "system" ? (snapshot.systemDark ? "dark" : "light") : theme;
+    theme === "system"
+      ? snapshot.systemDark
+        ? "dark"
+        : "light"
+      : theme === "light" ||
+          theme === "github-light" ||
+          theme === "catppuccin-latte" ||
+          theme === "vscode-light" ||
+          theme === "gruvbox-light" ||
+          theme === "solarized-light"
+        ? "light"
+        : "dark";
 
   const setTheme = useCallback((next: Theme) => {
     if (!hasThemeStorage()) return;

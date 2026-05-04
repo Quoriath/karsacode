@@ -105,6 +105,19 @@ function readCustomAgentApiKeyEnvVar(config: unknown): string {
   return readProviderConfigString(config, "apiKeyEnvVar") || DEFAULT_CUSTOM_AGENT_API_KEY_ENV_VAR;
 }
 
+function readModelContextWindows(config: unknown): Record<string, number> {
+  if (config === null || typeof config !== "object") return {};
+  const value = (config as Record<string, unknown>)["modelContextWindows"];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  const record: Record<string, number> = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (typeof val === "number" && Number.isFinite(val) && val > 0) {
+      record[key] = val;
+    }
+  }
+  return record;
+}
+
 function nextCustomAgentConfigWithApiKey(config: unknown, apiKey: string): Record<string, unknown> {
   const base: Record<string, unknown> =
     config !== null && typeof config === "object" ? { ...(config as Record<string, unknown>) } : {};
@@ -229,7 +242,7 @@ function ProviderAccentColorPicker(props: {
   };
 
   return (
-    <div className="grid gap-2">
+    <div className="grid gap-1.5">
       <span className="text-xs font-medium text-foreground">Accent color</span>
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         <input
@@ -345,7 +358,7 @@ export function ProviderEnvironmentSection(props: {
   };
 
   return (
-    <div className="grid gap-2">
+    <div className="grid gap-1.5">
       <div className="flex items-center justify-between gap-3">
         <span className="text-xs font-medium text-foreground">Environment variables</span>
         <Button
@@ -374,11 +387,11 @@ export function ProviderEnvironmentSection(props: {
           Add variables to pass API keys, base URLs, or other per-instance CLI settings.
         </p>
       ) : (
-        <div className="grid gap-2">
+        <div className="grid gap-1.5">
           {rows.map((variable, index) => (
             <div
               key={variable.id}
-              className="grid gap-2 rounded-md border border-border/70 bg-muted/20 p-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto_auto] sm:items-center"
+              className="grid gap-1.5 rounded-md border border-border/70 bg-muted/20 p-1.5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto_auto] sm:items-center"
             >
               <DraftInput
                 value={variable.name}
@@ -595,6 +608,11 @@ export function ProviderInstanceCard({
     );
   };
 
+  const updateModelContextWindows = (next: Record<string, number>) => {
+    const nextConfig = nextConfigBlobWithValue(instance.config, "modelContextWindows", next);
+    updateConfig(nextConfig);
+  };
+
   const updateCustomAgentApiKey = (value: string) => {
     const apiKey = value.trim();
     if (apiKey.length === 0) return;
@@ -628,9 +646,9 @@ export function ProviderInstanceCard({
 
   return (
     <div className="border-t border-border first:border-t-0">
-      <div className="px-4 py-4 sm:px-5">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0 flex-1 space-y-1">
+      <div className="px-3.5 py-3 sm:px-4">
+        <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <div className="flex min-h-5 items-center gap-1.5">
               {driverKind ? (
                 <ProviderInstanceIcon
@@ -742,7 +760,7 @@ export function ProviderInstanceCard({
       <Collapsible open={isExpanded} onOpenChange={onExpandedChange}>
         <CollapsibleContent>
           <div className="space-y-0">
-            <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+            <div className="border-t border-border/60 px-3.5 py-2.5 sm:px-4">
               <label htmlFor={`provider-instance-${instanceId}-display-name`} className="block">
                 <span className="text-xs font-medium text-foreground">Display name</span>
                 <DraftInput
@@ -759,7 +777,7 @@ export function ProviderInstanceCard({
               </label>
             </div>
 
-            <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+            <div className="border-t border-border/60 px-3.5 py-2.5 sm:px-4">
               <ProviderAccentColorPicker
                 displayName={displayName}
                 value={accentColor}
@@ -768,7 +786,7 @@ export function ProviderInstanceCard({
             </div>
 
             {instance.driver === CUSTOM_AGENT_DRIVER_KIND ? (
-              <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+              <div className="border-t border-border/60 px-3.5 py-2.5 sm:px-4">
                 <label htmlFor={`provider-instance-${instanceId}-api-key`} className="block">
                   <span className="text-xs font-medium text-foreground">API key</span>
                   <DraftInput
@@ -798,7 +816,7 @@ export function ProviderInstanceCard({
               </div>
             ) : null}
 
-            <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+            <div className="border-t border-border/60 px-3.5 py-2.5 sm:px-4">
               <ProviderEnvironmentSection
                 environment={instance.environment ?? []}
                 onChange={updateEnvironment}
@@ -828,9 +846,11 @@ export function ProviderInstanceCard({
                 onHiddenModelsChange={onHiddenModelsChange}
                 onFavoriteModelsChange={onFavoriteModelsChange}
                 onModelOrderChange={onModelOrderChange}
+                modelContextWindows={readModelContextWindows(instance.config)}
+                onModelContextWindowsChange={updateModelContextWindows}
               />
             ) : (
-              <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+              <div className="border-t border-border/60 px-3.5 py-2.5 sm:px-4">
                 <p className="text-xs text-muted-foreground">
                   This instance uses a driver (
                   <code className="text-foreground">{String(instance.driver)}</code>) that is not

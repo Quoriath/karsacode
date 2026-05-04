@@ -290,15 +290,15 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-xl overflow-hidden">
-        <div className="flex min-h-0 flex-col overflow-hidden border-foreground/10 bg-background shadow-2xl">
-          <DialogHeader className="border-b border-border/70 bg-background">
+      <DialogPopup className="max-w-2xl max-h-[85vh] overflow-hidden flex flex-col">
+        <div className="flex flex-col overflow-hidden border-foreground/10 bg-background shadow-2xl">
+          <DialogHeader className="flex-shrink-0 border-b border-border/70 bg-background px-6 py-3">
             <DialogTitle>Add provider instance</DialogTitle>
-            <DialogDescription>
+            <DialogDescription className="mt-1">
               Configure an additional provider instance — for example, a second Codex install
               pointed at a different workspace.
             </DialogDescription>
-            <div className="grid grid-cols-3 gap-2">
+            <div className="mt-2 grid grid-cols-3 gap-2">
               {wizardSteps.map((step, index) => (
                 <button
                   key={step}
@@ -342,9 +342,9 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
 
           <div
             data-slot="dialog-panel"
-            className="space-y-4 border-b border-border/70 bg-muted/20 px-6 py-5"
+            className="flex-1 overflow-y-auto space-y-3 border-b border-border/70 bg-muted/20 px-6 py-3"
           >
-            <div className={cn("grid gap-2", wizardStep !== 0 && "hidden")}>
+            <div className={cn("grid gap-1.5", wizardStep !== 0 && "hidden")}>
               <span id="add-instance-driver-label" className="text-xs font-medium text-foreground">
                 Driver
               </span>
@@ -408,7 +408,7 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
               </RadioGroup>
             </div>
 
-            <label className={cn("grid gap-2", wizardStep !== 1 && "hidden")}>
+            <label className={cn("grid gap-1.5", wizardStep !== 1 && "hidden")}>
               <span className="text-xs font-medium text-foreground">Label</span>
               <Input
                 className="bg-background"
@@ -421,7 +421,7 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
               </span>
             </label>
 
-            <label className={cn("grid gap-2", wizardStep !== 1 && "hidden")}>
+            <label className={cn("grid gap-1.5", wizardStep !== 1 && "hidden")}>
               <span className="text-xs font-medium text-foreground">Instance ID</span>
               <Input
                 className="bg-background"
@@ -442,7 +442,7 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
               )}
             </label>
 
-            <div className={cn("grid gap-2", wizardStep !== 1 && "hidden")}>
+            <div className={cn("grid gap-1.5", wizardStep !== 1 && "hidden")}>
               <span className="text-xs font-medium text-foreground">Accent color</span>
               <div className="flex min-w-0 flex-wrap items-center gap-2">
                 <input
@@ -490,9 +490,9 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
             </div>
 
             {driverSettingsFields.length > 0 ? (
-              <div className={cn("grid gap-4", wizardStep !== 2 && "hidden")}>
+              <div className={cn("grid gap-2", wizardStep !== 2 && "hidden")}>
                 {driver === CUSTOM_AGENT_DRIVER_KIND ? (
-                  <label className="grid gap-2">
+                  <label className="grid gap-1.5">
                     <span className="text-xs font-medium text-foreground">API key</span>
                     <Input
                       className="bg-background"
@@ -528,7 +528,7 @@ export function AddProviderInstanceDialog({ open, onOpenChange }: AddProviderIns
             ) : null}
           </div>
 
-          <DialogFooter className="border-t bg-background">
+          <DialogFooter className="flex-shrink-0 border-t bg-background px-6 py-3">
             <Button
               variant="outline"
               size="sm"

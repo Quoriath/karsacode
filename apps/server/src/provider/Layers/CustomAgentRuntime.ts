@@ -255,8 +255,81 @@ function estimateMessages(messages: ReadonlyArray<CustomAgentChatMessage>): numb
   return Math.ceil(messages.map((message) => message.content).join("\n").length / 4);
 }
 
-function contextBudget(settings: CustomAgentSettings): number {
-  return Math.max(8000, settings.maxContextTokens || 48000);
+function extractPromptTokensFromUsage(
+  usage: Record<string, unknown> | undefined,
+): number | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const promptTokens = usage.prompt_tokens;
+  return typeof promptTokens === "number" && promptTokens > 0 ? promptTokens : undefined;
+}
+
+async function contextBudget(
+  settings: CustomAgentSettings,
+  backend: CustomAgentLlmBackend,
+  model: string,
+): Promise<number> {
+  // Priority 1: Use maxInputTokens if explicitly set
+  if (settings.maxInputTokens && settings.maxInputTokens > 0) {
+    return Math.max(8000, settings.maxInputTokens);
+  }
+
+  // Priority 2: Check per-model context windows map
+  if (settings.modelContextWindows && settings.modelContextWindows[model]) {
+    const modelContext = settings.modelContextWindows[model];
+    if (modelContext > 0) {
+      console.log(`[ContextBudget] Using per-model context for ${model}: ${modelContext}`);
+      const reservedBuffer = 2000;
+      const maxOutput = settings.maxOutputTokens || 4000;
+      const calculatedInput = modelContext - maxOutput - reservedBuffer;
+      return Math.max(8000, calculatedInput);
+    }
+  }
+
+  // Priority 3: Try to get actual context window from API
+  let maxContext = settings.maxContextTokens;
+  let contextSource = "unknown";
+  if (backend.getModelContextWindow) {
+    try {
+      const apiContextWindow = await backend.getModelContextWindow(model);
+      if (apiContextWindow && apiContextWindow > 0) {
+        maxContext = apiContextWindow;
+        contextSource = "endpoint";
+      }
+    } catch {
+      // Silently fail, will use settings
+    }
+  }
+
+  // Get source for logging
+  if (backend.getContextWindowSource) {
+    try {
+      contextSource = await backend.getContextWindowSource(model);
+    } catch {
+      contextSource = "error";
+    }
+  }
+
+  // Priority 4: Use settings.maxContextTokens if available
+  if (!maxContext || maxContext <= 0) {
+    // If no context window info available at all, use a safe fallback
+    console.warn(
+      `[ContextBudget] No context window detected for model ${model} (source: ${contextSource}). Using safe fallback of 250k tokens. Set maxContextTokens manually in settings for accuracy.`,
+    );
+    maxContext = 250000; // 250k tokens - safe fallback
+  }
+
+  // Calculate input budget from context window
+  const reservedBuffer = 2000; // Safety buffer for system prompts, tool schemas, etc.
+  const maxOutput = settings.maxOutputTokens || 4000;
+  const calculatedInput = maxContext - maxOutput - reservedBuffer;
+
+  const finalBudget = Math.max(8000, calculatedInput);
+
+  console.log(
+    `[ContextBudget] Model: ${model}, MaxContext: ${maxContext}, Source: ${contextSource}, FinalInputBudget: ${finalBudget}`,
+  );
+
+  return finalBudget;
 }
 
 function compactPercent(tokens: number, budget: number): number {
@@ -470,13 +543,15 @@ async function completeCustomAgentModel(
   input: {
     readonly messages: ReadonlyArray<CustomAgentChatMessage>;
     readonly model: string;
+    readonly maxOutputTokens?: number | undefined;
   },
   onFinalContentDelta?: ((delta: string) => Promise<void>) | undefined,
-): Promise<string> {
+): Promise<{ content: string; usage?: Record<string, unknown> }> {
   let streamed = "";
   let emittedFinalContent = "";
   let pendingDeltaEmission: Promise<void> = Promise.resolve();
   let pendingDeltaEmissionError: unknown;
+  let streamUsage: Record<string, unknown> | undefined;
 
   const enqueueFinalContentDelta = (delta: string): void => {
     if (!onFinalContentDelta || delta.length === 0) return;
@@ -494,7 +569,11 @@ async function completeCustomAgentModel(
 
   let streamFailed = false;
   try {
-    for await (const chunk of backend.stream({ ...input, stream: true })) {
+    for await (const chunk of backend.stream({
+      ...input,
+      stream: true,
+      maxOutputTokens: input.maxOutputTokens,
+    })) {
       streamed += chunk;
       const finalContentPrefix = extractStreamingContentPrefix(streamed);
       if (
@@ -507,13 +586,24 @@ async function completeCustomAgentModel(
         enqueueFinalContentDelta(delta);
       }
     }
+    // Get usage from streaming backend if available
+    if (backend.getLastUsage) {
+      streamUsage = backend.getLastUsage();
+    }
   } catch {
     streamFailed = true;
     streamed = "";
   }
   await drainFinalContentDeltas();
-  if (!streamFailed && streamed.trim().length > 0) return streamed;
-  return (await backend.complete({ ...input, stream: false })).content;
+  if (!streamFailed && streamed.trim().length > 0) {
+    return { content: streamed, usage: streamUsage };
+  }
+  const completeResult = await backend.complete({
+    ...input,
+    stream: false,
+    maxOutputTokens: input.maxOutputTokens,
+  });
+  return { content: completeResult.content, usage: completeResult.usage };
 }
 
 export async function makeCustomAgentRuntime(input: {
@@ -570,16 +660,38 @@ export async function makeCustomAgentRuntime(input: {
     model: string,
   ): Promise<number> {
     if (!input.backend.countTokens) return estimateMessages(messages);
-    return await input.backend.countTokens({ messages, model }).catch(() => estimateMessages(messages));
+    return await input.backend
+      .countTokens({ messages, model })
+      .catch(() => estimateMessages(messages));
   }
 
   async function emitContextUsageSnapshot(inputState: {
     readonly state: CustomAgentSessionState;
     readonly turnId: TurnId;
     readonly usedTokens: number;
+    readonly model: string;
   }): Promise<void> {
     const usedTokens = Math.max(1, Math.round(inputState.usedTokens));
-    const maxTokens = Math.max(1, Math.round(contextBudget(input.settings)));
+    const model = inputState.model;
+    const maxTokens = Math.max(
+      1,
+      Math.round(await contextBudget(input.settings, input.backend, model)),
+    );
+
+    // Get context window source for debugging
+    let contextSource = "unknown";
+    if (input.backend.getContextWindowSource) {
+      try {
+        contextSource = await input.backend.getContextWindowSource(model);
+      } catch {
+        contextSource = "error";
+      }
+    }
+
+    console.log(
+      `[ContextWindow] Model: ${model}, Used: ${usedTokens}, Max: ${maxTokens}, Source: ${contextSource}`,
+    );
+
     inputState.state.tokenUsageEstimate = usedTokens;
     await emit({
       type: "thread.token-usage.updated",
@@ -593,6 +705,7 @@ export async function makeCustomAgentRuntime(input: {
           usedTokens,
           maxTokens,
           compactsAutomatically: input.settings.contextCompressionEnabled,
+          contextSource,
         },
       },
     } as ProviderRuntimeEvent);
@@ -609,7 +722,7 @@ export async function makeCustomAgentRuntime(input: {
     if (state.messages.length < CONTEXT_COMPACT_MIN_MESSAGES) return false;
 
     const model = state.session.model ?? input.settings.model;
-    const budget = contextBudget(input.settings);
+    const budget = await contextBudget(input.settings, input.backend, model);
     const tokenEstimate = await estimateModelInputTokens(
       [
         { role: "system", content: runtimePrompt },
@@ -665,8 +778,13 @@ export async function makeCustomAgentRuntime(input: {
         model,
         temperature: 0,
         stream: false,
+        maxOutputTokens: input.settings.maxOutputTokens,
       });
       const summary = normalizeCompactionOutput(compactOutput.content);
+      const compactPromptTokens = extractPromptTokensFromUsage(compactOutput.usage);
+      if (compactPromptTokens) {
+        console.log(`[Compaction] Actual prompt tokens from API: ${compactPromptTokens}`);
+      }
       const resumeMessage = buildCompactResumeMessage({
         summary,
         currentUserRequest,
@@ -920,10 +1038,12 @@ export async function makeCustomAgentRuntime(input: {
       }
       for (let step = 0; step < MAX_TOOL_STEPS; step++) {
         if (state.activeAbort?.signal.aborted) throw new Error("Turn interrupted.");
+        const model = state.session.model ?? input.settings.model;
+        const budget = await contextBudget(input.settings, input.backend, model);
         let workingContext = contextStore.buildWorkingContext({
           threadId: state.session.threadId,
           currentUserRequest: userInput,
-          maxTokens: input.settings.maxContextTokens,
+          maxTokens: budget,
         });
         const compacted = await maybeCompactContext({
           state,
@@ -935,7 +1055,7 @@ export async function makeCustomAgentRuntime(input: {
           workingContext = contextStore.buildWorkingContext({
             threadId: state.session.threadId,
             currentUserRequest: userInput,
-            maxTokens: Math.floor(contextBudget(input.settings) * 0.45),
+            maxTokens: Math.floor(budget * 0.45),
           });
         }
         const llmMessages: CustomAgentChatMessage[] = [
@@ -953,6 +1073,7 @@ export async function makeCustomAgentRuntime(input: {
             llmMessages,
             state.session.model ?? input.settings.model,
           ),
+          model: state.session.model ?? input.settings.model,
         });
         let liveFinalContent = "";
         const output = await completeCustomAgentModel(
@@ -960,6 +1081,7 @@ export async function makeCustomAgentRuntime(input: {
           {
             messages: llmMessages,
             model: state.session.model ?? input.settings.model,
+            maxOutputTokens: input.settings.maxOutputTokens,
           },
           async (delta) => {
             liveFinalContent += delta;
@@ -975,7 +1097,7 @@ export async function makeCustomAgentRuntime(input: {
             } as ProviderRuntimeEvent);
           },
         );
-        const parsed = parseCustomAgentModelCommand(output.trim());
+        const parsed = parseCustomAgentModelCommand(output.content.trim());
         if (!parsed.ok) {
           invalidCalls += 1;
           state.messages.push({
@@ -1013,10 +1135,13 @@ export async function makeCustomAgentRuntime(input: {
               payload: { streamKind: "assistant_text", delta: remainingContent },
             } as ProviderRuntimeEvent);
           state.messages.push({ role: "assistant", content: parsed.command.content });
+          const actualPromptTokens = extractPromptTokensFromUsage(output.usage);
+          const usedTokens = actualPromptTokens ?? estimateMessages(state.messages);
           await emitContextUsageSnapshot({
             state,
             turnId,
-            usedTokens: estimateMessages(state.messages),
+            usedTokens,
+            model: state.session.model ?? input.settings.model,
           });
           await emit({
             type: "item.completed",
@@ -1038,7 +1163,10 @@ export async function makeCustomAgentRuntime(input: {
             payload: {
               state: "completed",
               stopReason: "final",
-              usage: { estimatedTokens: estimateMessages(state.messages) },
+              usage: {
+                estimatedTokens: actualPromptTokens ?? estimateMessages(state.messages),
+                ...(output.usage && { apiUsage: output.usage }),
+              },
             },
           } as ProviderRuntimeEvent);
           state.session = {

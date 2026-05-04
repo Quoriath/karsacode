@@ -71,6 +71,10 @@ interface ProviderModelsSectionProps {
   readonly onHiddenModelsChange: (next: ReadonlyArray<string>) => void;
   readonly onFavoriteModelsChange: (next: ReadonlyArray<string>) => void;
   readonly onModelOrderChange: (next: ReadonlyArray<string>) => void;
+  /** Per-model context window settings (model slug -> max tokens). */
+  readonly modelContextWindows: Readonly<Record<string, number>>;
+  /** Handler to update per-model context window settings. */
+  readonly onModelContextWindowsChange: (next: Record<string, number>) => void;
 }
 
 /**
@@ -96,10 +100,14 @@ export function ProviderModelsSection({
   onHiddenModelsChange,
   onFavoriteModelsChange,
   onModelOrderChange,
+  modelContextWindows,
+  onModelContextWindowsChange,
 }: ProviderModelsSectionProps) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const [editingModelSlug, setEditingModelSlug] = useState<string | null>(null);
+  const [editingContextWindow, setEditingContextWindow] = useState<string>("");
   const hiddenModelSet = useMemo(() => new Set(hiddenModels), [hiddenModels]);
   const favoriteModelSet = useMemo(() => new Set(favoriteModels), [favoriteModels]);
   const orderedModels = useMemo(() => {
@@ -184,8 +192,38 @@ export function ProviderModelsSection({
     onModelOrderChange(next);
   };
 
+  const handleEditContextWindow = (slug: string) => {
+    setEditingModelSlug(slug);
+    setEditingContextWindow(String(modelContextWindows[slug] ?? ""));
+  };
+
+  const handleSaveContextWindow = () => {
+    if (!editingModelSlug) return;
+    const value = Number(editingContextWindow);
+    if (!Number.isFinite(value) || value <= 0) {
+      setEditingModelSlug(null);
+      setEditingContextWindow("");
+      return;
+    }
+    const next = { ...modelContextWindows, [editingModelSlug]: value };
+    onModelContextWindowsChange(next);
+    setEditingModelSlug(null);
+    setEditingContextWindow("");
+  };
+
+  const handleCancelEdit = () => {
+    setEditingModelSlug(null);
+    setEditingContextWindow("");
+  };
+
+  const handleRemoveContextWindow = (slug: string) => {
+    const next = { ...modelContextWindows };
+    delete next[slug];
+    onModelContextWindowsChange(next);
+  };
+
   return (
-    <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+    <div className="border-t border-border/60 px-3.5 py-2.5 sm:px-4">
       <div className="text-xs font-medium text-foreground">Models</div>
       <div className="mt-1 text-xs text-muted-foreground">
         {models.length} model{models.length === 1 ? "" : "s"} available.
@@ -227,7 +265,7 @@ export function ProviderModelsSection({
             <div
               key={`${instanceId}:${model.slug}`}
               className={cn(
-                "grid min-h-7 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 py-1",
+                "grid min-h-7 grid-cols-[minmax(0,1fr)_auto] items-center gap-1.5 py-1",
                 isHidden && "text-muted-foreground",
               )}
             >
@@ -275,6 +313,22 @@ export function ProviderModelsSection({
                 ) : null}
                 {model.isCustom ? (
                   <span className="text-[10px] text-muted-foreground">custom</span>
+                ) : null}
+                {modelContextWindows[model.slug] ? (
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <span className="text-[10px] text-blue-500">
+                          {modelContextWindows[model.slug]} tokens
+                        </span>
+                      }
+                    >
+                      <InfoIcon className="size-3" />
+                    </TooltipTrigger>
+                    <TooltipPopup side="top">
+                      Custom context window: {modelContextWindows[model.slug]} tokens
+                    </TooltipPopup>
+                  </Tooltip>
                 ) : null}
               </div>
               <div className="flex shrink-0 items-center gap-0.5">
@@ -359,6 +413,47 @@ export function ProviderModelsSection({
                     </TooltipPopup>
                   </Tooltip>
                 ) : null}
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        className={cn(
+                          "size-5 rounded-sm p-0",
+                          modelContextWindows[model.slug]
+                            ? "text-blue-500 hover:text-blue-600"
+                            : "text-muted-foreground hover:text-foreground",
+                        )}
+                        onClick={() => handleEditContextWindow(model.slug)}
+                        aria-label={`Edit context window for ${model.name}`}
+                      />
+                    }
+                  >
+                    <InfoIcon className="size-3" />
+                  </TooltipTrigger>
+                  <TooltipPopup side="top">
+                    {modelContextWindows[model.slug] ? "Edit context window" : "Set context window"}
+                  </TooltipPopup>
+                </Tooltip>
+                {modelContextWindows[model.slug] ? (
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <Button
+                          size="icon-xs"
+                          variant="ghost"
+                          className="size-5 rounded-sm p-0 text-muted-foreground hover:text-destructive"
+                          onClick={() => handleRemoveContextWindow(model.slug)}
+                          aria-label={`Remove context window for ${model.name}`}
+                        />
+                      }
+                    >
+                      <XIcon className="size-3" />
+                    </TooltipTrigger>
+                    <TooltipPopup side="top">Remove context window</TooltipPopup>
+                  </Tooltip>
+                ) : null}
                 {model.isCustom ? (
                   <Tooltip>
                     <TooltipTrigger
@@ -382,6 +477,43 @@ export function ProviderModelsSection({
           );
         })}
       </div>
+
+      {editingModelSlug ? (
+        <div className="mt-2.5 rounded-md border border-border/60 bg-muted/30 p-2.5">
+          <div className="text-xs font-medium text-foreground">
+            Edit context window for {editingModelSlug}
+          </div>
+          <div className="mt-2 flex gap-2">
+            <Input
+              id={`provider-instance-${instanceId}-context-window`}
+              type="number"
+              value={editingContextWindow}
+              onChange={(event) => setEditingContextWindow(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                handleSaveContextWindow();
+              }}
+              placeholder="128000"
+              spellCheck={false}
+              className="h-7 text-xs"
+            />
+            <Button
+              className="h-7 px-2 text-xs"
+              variant="default"
+              onClick={handleSaveContextWindow}
+            >
+              Save
+            </Button>
+            <Button className="h-7 px-2 text-xs" variant="outline" onClick={handleCancelEdit}>
+              Cancel
+            </Button>
+          </div>
+          <p className="mt-1.5 text-[10px] text-muted-foreground">
+            Max context tokens for this model (e.g., 128000 for GPT-4)
+          </p>
+        </div>
+      ) : null}
 
       <div className="mt-3 flex flex-col gap-2 sm:flex-row">
         <Input

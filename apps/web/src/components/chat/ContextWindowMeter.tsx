@@ -49,14 +49,14 @@ export function ContextWindowMeter(props: {
     usage === null
       ? "--"
       : usage.usedPercentage !== null
-      ? `${Math.round(usage.usedPercentage)}%`
-      : formatContextWindowTokens(usage.usedTokens);
+        ? `${Math.round(usage.usedPercentage)}%`
+        : formatContextWindowTokens(usage.usedTokens);
   const accessibleLabel =
     usage === null
       ? "Context window usage not available yet"
       : usage.maxTokens !== null && usedPercentage
-      ? `Context window ${usedPercentage} used`
-      : `Context window ${formatContextWindowTokens(usage.usedTokens)} tokens used`;
+        ? `Context window ${usedPercentage} used`
+        : `Context window ${formatContextWindowTokens(usage.usedTokens)} tokens used`;
   const meter = (
     <span className={cn("relative flex h-6 w-6 items-center justify-center", toneClassName)}>
       <svg
@@ -89,8 +89,8 @@ export function ContextWindowMeter(props: {
         {usage === null
           ? "?"
           : usage.usedPercentage !== null
-          ? Math.round(usage.usedPercentage)
-          : formatContextWindowTokens(usage.usedTokens)}
+            ? Math.round(usage.usedPercentage)
+            : formatContextWindowTokens(usage.usedTokens)}
       </span>
     </span>
   );
@@ -107,7 +107,7 @@ export function ContextWindowMeter(props: {
             className={cn(
               "group inline-flex shrink-0 items-center justify-center transition-opacity hover:opacity-85",
               variant === "pill"
-                  ? cn(
+                ? cn(
                     "h-7 gap-1.5 rounded-full border px-2 text-xs font-medium",
                     getContextWindowPillTone(usage?.usedPercentage ?? null),
                   )

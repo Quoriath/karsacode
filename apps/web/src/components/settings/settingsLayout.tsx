@@ -27,16 +27,16 @@ export function SettingsSection({
   children: ReactNode;
 }) {
   return (
-    <section className="space-y-2.5">
+    <section className="space-y-2">
       <div className="flex h-5 items-center justify-between px-1">
-        <h2 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-foreground/50">
+        <h2 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-foreground/60">
           <span className="inline-block h-px w-3 bg-border" aria-hidden />
           {icon}
           {title}
         </h2>
         <div className="flex h-5 min-w-5 items-center justify-end">{headerAction}</div>
       </div>
-      <div className="relative overflow-hidden rounded-2xl border bg-card text-card-foreground shadow-sm/4 not-dark:bg-clip-padding before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-2xl)-1px)] before:shadow-[0_1px_--theme(--color-black/4%)] dark:shadow-none dark:before:shadow-[0_-1px_--theme(--color-white/6%)]">
+      <div className="relative overflow-hidden rounded-xl border border-border/70 bg-card text-card-foreground shadow-sm/8 transition-colors duration-200">
         {children}
       </div>
     </section>
@@ -61,12 +61,12 @@ export function SettingsRow({
   return (
     <div
       className={cn(
-        "border-t border-border/60 px-4 first:border-t-0 sm:px-5",
-        children ? "pt-4 pb-0" : "py-4",
+        "border-t border-border/60 px-3.5 first:border-t-0 sm:px-4",
+        children ? "py-3" : "py-3",
       )}
     >
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0 flex-1 space-y-1">
+      <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0 flex-1 space-y-0.5">
           <div className="flex min-h-5 items-center gap-1.5">
             <h3 className="text-[13px] font-semibold tracking-[-0.01em] text-foreground">
               {title}
@@ -115,8 +115,8 @@ export function SettingResetButton({ label, onClick }: { label: string; onClick:
 
 export function SettingsPageContainer({ children }: { children: ReactNode }) {
   return (
-    <div className="flex-1 overflow-y-auto p-6 sm:p-8">
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-8">{children}</div>
+    <div className="flex-1 overflow-y-auto bg-background p-5 sm:p-6">
+      <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">{children}</div>
     </div>
   );
 }

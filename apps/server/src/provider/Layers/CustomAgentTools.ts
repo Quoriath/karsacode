@@ -663,7 +663,8 @@ export function makeCustomAgentToolRegistry(input: {
         "summarize_artifact",
       ]);
       if (calls.length === 0) return { ok: false, content: "tool_batch needs non-empty calls." };
-      const results: Array<{ tool: string; ok: boolean; content: string; artifactId?: string }> = [];
+      const results: Array<{ tool: string; ok: boolean; content: string; artifactId?: string }> =
+        [];
       for (const [index, call] of calls.slice(0, 6).entries()) {
         const tool = typeof call.tool === "string" ? call.tool : "";
         const callArgs =

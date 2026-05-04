@@ -10,6 +10,7 @@ export interface CustomAgentLlmInput {
   readonly model: string;
   readonly temperature?: number | undefined;
   readonly stream?: boolean | undefined;
+  readonly maxOutputTokens?: number | undefined;
 }
 
 export interface CustomAgentLlmOutput {
@@ -22,6 +23,7 @@ export interface CustomAgentLlmBackend {
   readonly stream: (input: CustomAgentLlmInput) => AsyncIterable<string>;
   readonly getLastUsage?: (() => Record<string, unknown> | undefined) | undefined;
   readonly getModelContextWindow?: ((model: string) => Promise<number | undefined>) | undefined;
+  readonly getContextWindowSource?: ((model: string) => Promise<string>) | undefined;
   readonly countTokens?: ((input: CustomAgentLlmInput) => Promise<number>) | undefined;
   readonly supportsNativeToolCalling: boolean;
   readonly supportsJsonMode: boolean;
@@ -105,6 +107,7 @@ function buildRequestBody(input: CustomAgentLlmInput, stream: boolean): string {
     messages: input.messages,
     temperature: input.temperature ?? 0.2,
     stream,
+    ...(input.maxOutputTokens && { max_tokens: input.maxOutputTokens }),
   };
   return JSON.stringify(
     stream
@@ -121,7 +124,9 @@ type OpenAiCompatibleStreamChunk = {
   }>;
 };
 
-function extractOpenAiCompatibleStreamChunk(data: string):
+function extractOpenAiCompatibleStreamChunk(
+  data: string,
+):
   | { readonly content?: string | undefined; readonly usage?: Record<string, unknown> | undefined }
   | undefined {
   let json: OpenAiCompatibleStreamChunk;
@@ -142,6 +147,81 @@ function normalizeStreamingLine(line: string): string | undefined {
   return trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
 }
 
+function extractModelContextWindow(
+  modelsResponse: unknown,
+  targetModel: string,
+): number | undefined {
+  if (!modelsResponse || typeof modelsResponse !== "object") return undefined;
+
+  const response = modelsResponse as Record<string, unknown>;
+
+  // Handle both array and object with data property
+  const modelsArray = Array.isArray(response)
+    ? response
+    : Array.isArray(response.data)
+      ? (response.data as Array<unknown>)
+      : undefined;
+
+  if (!modelsArray || modelsArray.length === 0) return undefined;
+
+  // Find the model by ID (exact match first, then partial match)
+  const model = modelsArray.find((m) => {
+    if (!m || typeof m !== "object") return false;
+    const modelObj = m as Record<string, unknown>;
+    const id = modelObj.id;
+    if (typeof id === "string") {
+      return id === targetModel || id.includes(targetModel) || targetModel.includes(id);
+    }
+    return false;
+  });
+
+  if (!model || typeof model !== "object") return undefined;
+
+  const modelObj = model as Record<string, unknown>;
+
+  // Try common field names for context window (more comprehensive list)
+  const contextWindowFields = [
+    "max_tokens",
+    "max_model_len",
+    "context_length",
+    "context_window",
+    "max_context_tokens",
+    "context_limit",
+    "max_context_length",
+    "context_window_size",
+    "max_sequence_length",
+    "n_ctx",
+    "ctx_len",
+    "model_max_length",
+    "tokens",
+    "token_limit",
+  ];
+
+  for (const field of contextWindowFields) {
+    const value = modelObj[field];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+
+  // Try nested objects (e.g., OpenRouter format)
+  if (typeof modelObj.top_provider === "object" && modelObj.top_provider !== null) {
+    const topProvider = modelObj.top_provider as Record<string, unknown>;
+    const nestedFields = ["context_length", "max_completion_tokens", "context_window"];
+    for (const field of nestedFields) {
+      const value = topProvider[field];
+      if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+        // For context_length, this is usually the total context
+        if (field === "context_length" || field === "context_window") {
+          return value as number;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
 export function makeOpenAiCompatibleCustomAgentBackend(
   settings: CustomAgentSettings,
   env: NodeJS.ProcessEnv,
@@ -153,6 +233,7 @@ export function makeOpenAiCompatibleCustomAgentBackend(
   const apiKeyValue = apiKey ?? "";
   let lastUsage: Record<string, unknown> | undefined;
   const modelContextWindowCache = new Map<string, number | undefined>();
+  const modelContextWindowSourceCache = new Map<string, string>();
   const post = async (
     url: string,
     authHeaders: Record<string, string>,
@@ -167,10 +248,7 @@ export function makeOpenAiCompatibleCustomAgentBackend(
       },
       body,
     });
-  const getJson = async (
-    url: string,
-    authHeaders: Record<string, string>,
-  ): Promise<Response> =>
+  const getJson = async (url: string, authHeaders: Record<string, string>): Promise<Response> =>
     await fetch(url, {
       method: "GET",
       headers: {
@@ -223,6 +301,80 @@ export function makeOpenAiCompatibleCustomAgentBackend(
       throw new Error(describeFetchFailure(error, modelsUrl), { cause: error });
     }
   };
+  const getModelContextWindow = async (model: string): Promise<number | undefined> => {
+    // Check cache first
+    if (modelContextWindowCache.has(model)) {
+      const cached = modelContextWindowCache.get(model);
+      if (cached !== undefined && cached > 0) return cached;
+    }
+
+    console.log(`[CustomAgent] Detecting context window for model: ${model}`);
+    let source: string = "unknown";
+
+    // Priority 1: Try to detect from /models endpoint aggressively
+    try {
+      const response = await fetchModels();
+      console.log(`[CustomAgent] /models endpoint response status: ${response?.status}`);
+      if (response?.ok) {
+        const json = (await response.json().catch(() => undefined)) as unknown;
+        console.log(`[CustomAgent] /models response parsed, attempting extraction`);
+        const contextWindow = extractModelContextWindow(json, model);
+        if (contextWindow && contextWindow > 0) {
+          console.log(
+            `[CustomAgent] ✓ Successfully extracted context window from API: ${contextWindow}`,
+          );
+          source = "endpoint";
+          modelContextWindowCache.set(model, contextWindow);
+          modelContextWindowSourceCache.set(model, source);
+          return contextWindow;
+        } else {
+          console.log(`[CustomAgent] ✗ Could not extract context window from /models response`);
+          source = "endpoint-failed";
+        }
+      } else {
+        console.log(`[CustomAgent] ✗ /models endpoint returned status: ${response?.status}`);
+        source = "endpoint-error";
+      }
+    } catch (error) {
+      console.log(`[CustomAgent] ✗ Error fetching /models endpoint: ${error}`);
+      source = "endpoint-exception";
+    }
+
+    // If force endpoint detection is enabled, fail here
+    if (settings.forceEndpointContextDetection) {
+      const errorMsg = `Context window detection failed for model ${model}. Endpoint did not provide context information and force-endpoint-detection is enabled.`;
+      console.log(`[CustomAgent] ${errorMsg}`);
+      throw new Error(errorMsg);
+    }
+
+    // Priority 2: Use user config if explicitly set (ONLY if explicitly set > 0)
+    if (settings.maxContextTokens && settings.maxContextTokens > 0) {
+      console.log(`[CustomAgent] Using user config maxContextTokens: ${settings.maxContextTokens}`);
+      source = "user-config";
+      modelContextWindowCache.set(model, settings.maxContextTokens);
+      modelContextWindowSourceCache.set(model, source);
+      return settings.maxContextTokens;
+    }
+
+    // NO model name inference - it's unreliable and causes false positives like 994k for non-1M models
+    // If we can't get it from endpoint or user config, return undefined
+    console.log(
+      `[CustomAgent] ✗ Could not determine context window for ${model} - endpoint doesn't provide info and no user config set. Please set maxContextTokens manually in settings.`,
+    );
+    source = "not-detected";
+    modelContextWindowCache.set(model, undefined);
+    modelContextWindowSourceCache.set(model, source);
+    return undefined;
+  };
+
+  const getContextWindowSource = async (model: string): Promise<string> => {
+    if (modelContextWindowSourceCache.has(model)) {
+      return modelContextWindowSourceCache.get(model) ?? "unknown";
+    }
+    // Trigger detection if not cached
+    await getModelContextWindow(model);
+    return modelContextWindowSourceCache.get(model) ?? "unknown";
+  };
   const complete = async (input: CustomAgentLlmInput): Promise<CustomAgentLlmOutput> => {
     lastUsage = undefined;
     const response = await fetchChatCompletions(input, false);
@@ -243,18 +395,6 @@ export function makeOpenAiCompatibleCustomAgentBackend(
     }
     lastUsage = json.usage;
     return { content: json.choices?.[0]?.message?.content ?? "", usage: json.usage };
-  };
-  const getModelContextWindow = async (model: string): Promise<number | undefined> => {
-    if (modelContextWindowCache.has(model)) return modelContextWindowCache.get(model);
-    const response = await fetchModels().catch(() => undefined);
-    if (!response?.ok) {
-      modelContextWindowCache.set(model, undefined);
-      return undefined;
-    }
-    const json = (await response.json().catch(() => undefined)) as unknown;
-    const contextWindow = extractModelContextWindow(json, model);
-    modelContextWindowCache.set(model, contextWindow);
-    return contextWindow;
   };
   const stream = async function* (input: CustomAgentLlmInput): AsyncIterable<string> {
     lastUsage = undefined;
@@ -317,6 +457,7 @@ export function makeOpenAiCompatibleCustomAgentBackend(
     stream,
     getLastUsage: () => lastUsage,
     getModelContextWindow,
+    getContextWindowSource,
     countTokens: async (input) =>
       Math.ceil(input.messages.map((message) => message.content).join("\n").length / 4),
     supportsNativeToolCalling: false,

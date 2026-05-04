@@ -58,7 +58,10 @@ function extensionLabel(file: string): string {
   return path.extname(file).slice(1).toLowerCase() || "<none>";
 }
 
-function topEntries(counts: Map<string, number>, limit: number): ReadonlyArray<{
+function topEntries(
+  counts: Map<string, number>,
+  limit: number,
+): ReadonlyArray<{
   readonly name: string;
   readonly count: number;
 }> {
@@ -127,7 +130,9 @@ export async function getCustomAgentProjectContext(input: {
   const root = normalizeCustomAgentPath(input.settings, input.workspaceRoot, ".");
   const maxFiles = input.maxFiles ?? 20_000;
   const files = await walk(root, maxFiles + 1);
-  const visibleFiles = files.slice(0, maxFiles).map((file) => path.relative(input.workspaceRoot, file));
+  const visibleFiles = files
+    .slice(0, maxFiles)
+    .map((file) => path.relative(input.workspaceRoot, file));
   const extensionCounts = new Map<string, number>();
   const dirCounts = new Map<string, number>();
   for (const file of visibleFiles) {
@@ -234,10 +239,7 @@ export async function listCustomAgentFiles(input: {
   }
   const counts = new Map<string, number>();
   for (const file of files)
-    counts.set(
-      extensionLabel(file),
-      (counts.get(extensionLabel(file)) ?? 0) + 1,
-    );
+    counts.set(extensionLabel(file), (counts.get(extensionLabel(file)) ?? 0) + 1);
   return {
     files,
     raw: files.join("\n"),

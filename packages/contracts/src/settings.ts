@@ -430,6 +430,7 @@ export const CustomAgentSettings = makeProviderSettingsSchema(
           control: "json-record",
           placeholder: '{ "HTTP-Referer": "https://example.com" }',
           clearWhenEmpty: "omit",
+          hidden: true,
         },
       }),
     ),
@@ -442,14 +443,6 @@ export const CustomAgentSettings = makeProviderSettingsSchema(
           placeholder: ".devin/custom-agent-system.md",
           clearWhenEmpty: "omit",
         },
-      }),
-    ),
-    homePath: TrimmedString.pipe(
-      Schema.withDecodingDefault(Effect.succeed("")),
-      Schema.annotateKey({
-        title: "Home path",
-        description: "Optional home/state directory for this custom agent instance.",
-        providerSettingsForm: { placeholder: "~/.t3/custom-agent", clearWhenEmpty: "omit" },
       }),
     ),
     workspaceRoot: TrimmedString.pipe(
@@ -489,7 +482,12 @@ export const CustomAgentSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Max tool output bytes",
         description: "Maximum raw output captured from one tool call.",
-        providerSettingsForm: { control: "number", placeholder: "1000000", clearWhenEmpty: "omit" },
+        providerSettingsForm: {
+          control: "number",
+          placeholder: "1000000",
+          clearWhenEmpty: "omit",
+          hidden: true,
+        },
       }),
     ),
     maxToolPreviewBytes: Schema.Number.pipe(
@@ -497,15 +495,71 @@ export const CustomAgentSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Max tool preview bytes",
         description: "Maximum output preview sent back into the model context.",
-        providerSettingsForm: { control: "number", placeholder: "8000", clearWhenEmpty: "omit" },
+        providerSettingsForm: {
+          control: "number",
+          placeholder: "8000",
+          clearWhenEmpty: "omit",
+          hidden: true,
+        },
       }),
     ),
     maxContextTokens: Schema.Number.pipe(
-      Schema.withDecodingDefault(Effect.succeed(48_000)),
+      Schema.withDecodingDefault(Effect.succeed(0)),
       Schema.annotateKey({
         title: "Max context tokens",
-        description: "Soft context budget used by output reduction.",
-        providerSettingsForm: { control: "number", placeholder: "48000", clearWhenEmpty: "omit" },
+        description:
+          "Total context window (input + output). If 0 and endpoint doesn't provide info, uses safe fallback (250k). Set manually for accuracy.",
+        providerSettingsForm: {
+          control: "number",
+          placeholder: "0 = auto (250k fallback)",
+          clearWhenEmpty: "omit",
+          hidden: true,
+        },
+      }),
+    ),
+    forceEndpointContextDetection: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Force endpoint context detection",
+        description:
+          "If true, requires context window to be detected from API endpoint. Fails if endpoint doesn't provide context info.",
+        providerSettingsForm: { control: "switch", clearWhenEmpty: "omit", hidden: true },
+      }),
+    ),
+    maxInputTokens: Schema.Number.pipe(
+      Schema.withDecodingDefault(Effect.succeed(0)),
+      Schema.annotateKey({
+        title: "Max input tokens",
+        description:
+          "Maximum input tokens (prompt). If 0, auto-calculated from detected context window minus output. Set manually for precision control.",
+        providerSettingsForm: {
+          control: "number",
+          placeholder: "0 = auto-calculate",
+          clearWhenEmpty: "omit",
+          hidden: true,
+        },
+      }),
+    ),
+    maxOutputTokens: Schema.Number.pipe(
+      Schema.withDecodingDefault(Effect.succeed(4_000)),
+      Schema.annotateKey({
+        title: "Max output tokens",
+        description: "Maximum completion tokens (output). Reserved from context window.",
+        providerSettingsForm: { control: "number", placeholder: "4000", clearWhenEmpty: "omit" },
+      }),
+    ),
+    modelContextWindows: Schema.Record(Schema.String, Schema.Number).pipe(
+      Schema.withDecodingDefault(Effect.succeed({})),
+      Schema.annotateKey({
+        title: "Per-model context windows",
+        description:
+          'Map of model names to their max context tokens. Overrides endpoint detection and global settings for specific models. Example: { "gpt-4": 128000, "gpt-4-turbo": 128000 }',
+        providerSettingsForm: {
+          control: "textarea",
+          placeholder: '{\n  "gpt-4": 128000,\n  "gpt-4-turbo": 128000\n}',
+          clearWhenEmpty: "omit",
+          hidden: true,
+        },
       }),
     ),
     maxFileReadBytes: Schema.Number.pipe(
@@ -701,6 +755,10 @@ export const CustomAgentSettings = makeProviderSettingsSchema(
       "allowedPaths",
       "blockedPaths",
       "contextCompressionEnabled",
+      "maxContextTokens",
+      "forceEndpointContextDetection",
+      "maxInputTokens",
+      "maxOutputTokens",
       "redactSecrets",
       "autoSummarizeLargeOutputs",
       "checkpointEnabled",
